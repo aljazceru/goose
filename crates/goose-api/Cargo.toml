@@ -19,4 +19,6 @@ config = "0.13"
 jsonwebtoken = "8"
 futures = "0.3"
 futures-util = "0.3"
+# For session IDs
+uuid = { version = "1", features = ["serde", "v4"] }
  # Add dynamic-library for extension loading
