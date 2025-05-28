@@ -2,7 +2,13 @@ use warp::{Filter, Rejection};
 use warp::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
-use goose::agents::{Agent, extension_manager::ExtensionManager};
+use goose::agents::{
+    extension::Envs,
+    Agent,
+    extension_manager::ExtensionManager,
+    ExtensionConfig,
+};
+use mcp_core::tool::Tool;
 use goose::config::Config;
 use goose::providers::{create, providers};
 use goose::model::ModelConfig;
@@ -40,6 +46,51 @@ struct ExtensionsResponse {
 struct ProviderConfig {
     provider: String,
     model: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExtensionResponse {
+    error: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ExtensionConfigRequest {
+    #[serde(rename = "sse")]
+    Sse {
+        name: String,
+        uri: String,
+        #[serde(default)]
+        envs: Envs,
+        #[serde(default)]
+        env_keys: Vec<String>,
+        timeout: Option<u64>,
+    },
+    #[serde(rename = "stdio")]
+    Stdio {
+        name: String,
+        cmd: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        envs: Envs,
+        #[serde(default)]
+        env_keys: Vec<String>,
+        timeout: Option<u64>,
+    },
+    #[serde(rename = "builtin")]
+    Builtin {
+        name: String,
+        display_name: Option<String>,
+        timeout: Option<u64>,
+    },
+    #[serde(rename = "frontend")]
+    Frontend {
+        name: String,
+        tools: Vec<Tool>,
+        instructions: Option<String>,
+    },
 }
 
 async fn start_session_handler(
@@ -175,6 +226,128 @@ async fn get_provider_config_handler() -> Result<impl warp::Reply, Rejection> {
     
     let response = ProviderConfig { provider, model };
     Ok::<warp::reply::Json, warp::Rejection>(warp::reply::json(&response))
+}
+
+async fn add_extension_handler(
+    req: ExtensionConfigRequest,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Adding extension: {:?}", req);
+
+    #[cfg(target_os = "windows")]
+    if let ExtensionConfigRequest::Stdio { cmd, .. } = &req {
+        if cmd.ends_with("npx.cmd") || cmd.ends_with("npx") {
+            let node_exists = std::path::Path::new(r"C:\Program Files\nodejs\node.exe").exists()
+                || std::path::Path::new(r"C:\Program Files (x86)\nodejs\node.exe").exists();
+
+            if !node_exists {
+                let cmd_path = std::path::Path::new(cmd);
+                let script_dir = cmd_path.parent().ok_or_else(|| warp::reject())?;
+
+                let install_script = script_dir.join("install-node.cmd");
+
+                if install_script.exists() {
+                    eprintln!("Installing Node.js...");
+                    let output = std::process::Command::new(&install_script)
+                        .arg("https://nodejs.org/dist/v23.10.0/node-v23.10.0-x64.msi")
+                        .output()
+                        .map_err(|_| warp::reject())?;
+
+                    if !output.status.success() {
+                        eprintln!(
+                            "Failed to install Node.js: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        let resp = ExtensionResponse {
+                            error: true,
+                            message: Some(format!(
+                                "Failed to install Node.js: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            )),
+                        };
+                        return Ok(warp::reply::json(&resp));
+                    }
+                    eprintln!("Node.js installation completed");
+                } else {
+                    eprintln!(
+                        "Node.js installer script not found at: {}",
+                        install_script.display()
+                    );
+                    let resp = ExtensionResponse {
+                        error: true,
+                        message: Some("Node.js installer script not found".to_string()),
+                    };
+                    return Ok(warp::reply::json(&resp));
+                }
+            }
+        }
+    }
+
+    let extension = match req {
+        ExtensionConfigRequest::Sse { name, uri, envs, env_keys, timeout } => {
+            ExtensionConfig::Sse {
+                name,
+                uri,
+                envs,
+                env_keys,
+                description: None,
+                timeout,
+                bundled: None,
+            }
+        }
+        ExtensionConfigRequest::Stdio { name, cmd, args, envs, env_keys, timeout } => {
+            ExtensionConfig::Stdio {
+                name,
+                cmd,
+                args,
+                envs,
+                env_keys,
+                timeout,
+                description: None,
+                bundled: None,
+            }
+        }
+        ExtensionConfigRequest::Builtin { name, display_name, timeout } => {
+            ExtensionConfig::Builtin {
+                name,
+                display_name,
+                timeout,
+                bundled: None,
+            }
+        }
+        ExtensionConfigRequest::Frontend { name, tools, instructions } => {
+            ExtensionConfig::Frontend {
+                name,
+                tools,
+                instructions,
+                bundled: None,
+            }
+        }
+    };
+
+    let agent = AGENT.lock().await;
+    let result = agent.add_extension(extension).await;
+
+    let resp = match result {
+        Ok(_) => ExtensionResponse { error: false, message: None },
+        Err(e) => ExtensionResponse {
+            error: true,
+            message: Some(format!("Failed to add extension configuration, error: {:?}", e)),
+        },
+    };
+    Ok(warp::reply::json(&resp))
+}
+
+async fn remove_extension_handler(
+    name: String,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Removing extension: {}", name);
+    let agent = AGENT.lock().await;
+    agent.remove_extension(&name).await;
+
+    let resp = ExtensionResponse { error: false, message: None };
+    Ok(warp::reply::json(&resp))
 }
 
 fn with_api_key(api_key: String) -> impl Filter<Extract = (String,), Error = Rejection> + Clone {
@@ -344,6 +517,22 @@ async fn main() -> Result<(), anyhow::Error> {
         .and(warp::path("list"))
         .and(warp::get())
         .and_then(list_extensions_handler);
+
+    // Add extension endpoint
+    let add_extension = warp::path("extensions")
+        .and(warp::path("add"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(add_extension_handler);
+
+    // Remove extension endpoint
+    let remove_extension = warp::path("extensions")
+        .and(warp::path("remove"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(remove_extension_handler);
     
     // Get provider configuration endpoint
     let get_provider_config = warp::path("provider")
@@ -355,6 +544,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let routes = start_session
         .or(reply_session)
         .or(list_extensions)
+        .or(add_extension)
+        .or(remove_extension)
         .or(get_provider_config);
     
     // Get bind address from configuration or use default
