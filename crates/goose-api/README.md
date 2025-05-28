@@ -165,7 +165,56 @@ By default, the server runs on `127.0.0.1:8080`. You can modify this using confi
 }
 ```
 
-### 4. Get Provider Configuration
+### 4. Add Extension
+
+**Endpoint**: `POST /extensions/add`
+
+**Description**: Installs or enables an extension.
+
+**Request**:
+- Headers:
+  - Content-Type: application/json
+  - x-api-key: [your-api-key]
+- Body (example):
+```json
+{
+  "type": "builtin",
+  "name": "mcp_say"
+}
+```
+
+**Response**:
+```json
+{
+  "error": false,
+  "message": null
+}
+```
+
+### 5. Remove Extension
+
+**Endpoint**: `POST /extensions/remove`
+
+**Description**: Removes or disables an extension by name.
+
+**Request**:
+- Headers:
+  - Content-Type: application/json
+  - x-api-key: [your-api-key]
+- Body:
+```json
+"mcp_say"
+```
+
+**Response**:
+```json
+{
+  "error": false,
+  "message": null
+}
+```
+
+### 6. Get Provider Configuration
 
 **Endpoint**: `GET /provider/config`
 
@@ -204,6 +253,18 @@ curl -X POST http://localhost:8080/session/reply \
 curl -X GET http://localhost:8080/extensions/list \
   -H "x-api-key: your_secure_api_key"
 
+# Add an extension
+curl -X POST http://localhost:8080/extensions/add \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your_secure_api_key" \
+  -d '{"type": "builtin", "name": "mcp_say"}'
+
+# Remove an extension
+curl -X POST http://localhost:8080/extensions/remove \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your_secure_api_key" \
+  -d '"mcp_say"'
+
 # Get provider configuration
 curl -X GET http://localhost:8080/provider/config \
   -H "x-api-key: your_secure_api_key"
@@ -239,6 +300,22 @@ print(response.json())
 
 # List extensions
 response = requests.get(f"{API_URL}/extensions/list", headers=HEADERS)
+print(response.json())
+
+# Add an extension
+response = requests.post(
+    f"{API_URL}/extensions/add",
+    headers=HEADERS,
+    json={"type": "builtin", "name": "mcp_say"}
+)
+print(response.json())
+
+# Remove an extension
+response = requests.post(
+    f"{API_URL}/extensions/remove",
+    headers=HEADERS,
+    json="mcp_say"
+)
 print(response.json())
 
 # Get provider configuration
