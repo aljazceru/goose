@@ -2,8 +2,17 @@ use warp::{Filter, Rejection};
 use warp::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
-use goose::agents::{Agent, ExtensionConfig, extension_manager::ExtensionManager};
 use goose::config::{Config, ExtensionEntry};
+use goose::agents::{
+    extension::Envs,
+    Agent,
+    extension_manager::ExtensionManager,
+    ExtensionConfig,
+};
+use mcp_core::tool::Tool;
+use std::collections::HashMap;
+use uuid::Uuid;
+
 use goose::providers::{create, providers};
 use goose::model::ModelConfig;
 use goose::message::Message;
@@ -20,6 +29,11 @@ static AGENT: LazyLock<tokio::sync::Mutex<Agent>> = LazyLock::new(|| {
     tokio::sync::Mutex::new(Agent::new())
 });
 
+// Global store for session histories
+static SESSION_HISTORY: LazyLock<tokio::sync::Mutex<HashMap<Uuid, Vec<Message>>>> = LazyLock::new(|| {
+    tokio::sync::Mutex::new(HashMap::new())
+});
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRequest {
     prompt: String,
@@ -29,6 +43,24 @@ struct SessionRequest {
 struct ApiResponse {
     message: String,
     status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StartSessionResponse {
+    message: String,
+    status: String,
+    session_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionReplyRequest {
+    session_id: Uuid,
+    prompt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EndSessionRequest {
+    session_id: Uuid,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,37 +74,93 @@ struct ProviderConfig {
     model: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ExtensionResponse {
+    error: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ExtensionConfigRequest {
+    #[serde(rename = "sse")]
+    Sse {
+        name: String,
+        uri: String,
+        #[serde(default)]
+        envs: Envs,
+        #[serde(default)]
+        env_keys: Vec<String>,
+        timeout: Option<u64>,
+    },
+    #[serde(rename = "stdio")]
+    Stdio {
+        name: String,
+        cmd: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        envs: Envs,
+        #[serde(default)]
+        env_keys: Vec<String>,
+        timeout: Option<u64>,
+    },
+    #[serde(rename = "builtin")]
+    Builtin {
+        name: String,
+        display_name: Option<String>,
+        timeout: Option<u64>,
+    },
+    #[serde(rename = "frontend")]
+    Frontend {
+        name: String,
+        tools: Vec<Tool>,
+        instructions: Option<String>,
+    },
+}
+
 async fn start_session_handler(
     req: SessionRequest,
     _api_key: String,
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Starting session with prompt: {}", req.prompt);
-    
-    let agent = AGENT.lock().await;
-    
+
+    let mut agent = AGENT.lock().await;
+
     // Create a user message with the prompt
-    let messages = vec![Message::user().with_text(&req.prompt)];
-    
-    // Process the messages through the agent
+    let mut messages = vec![Message::user().with_text(&req.prompt)];
+
+    // Generate a new session ID and process the messages
+    let session_id = Uuid::new_v4();
+
     let result = agent.reply(&messages, None).await;
-    
+
     match result {
         Ok(mut stream) => {
             // Process the stream to get the first response
             if let Ok(Some(response)) = stream.try_next().await {
                 let response_text = response.as_concat_text();
-                let api_response = ApiResponse {
-                    message: format!("Session started with prompt: {}. Response: {}", req.prompt, response_text),
+                messages.push(response);
+                let mut history = SESSION_HISTORY.lock().await;
+                history.insert(session_id, messages);
+
+                let api_response = StartSessionResponse {
+                    message: response_text,
                     status: "success".to_string(),
+                    session_id,
                 };
                 Ok(warp::reply::with_status(
                     warp::reply::json(&api_response),
                     warp::http::StatusCode::OK,
                 ))
             } else {
-                let api_response = ApiResponse {
-                    message: format!("Session started but no response generated"),
+                let mut history = SESSION_HISTORY.lock().await;
+                history.insert(session_id, messages);
+
+                let api_response = StartSessionResponse {
+                    message: "Session started but no response generated".to_string(),
                     status: "warning".to_string(),
+                    session_id,
                 };
                 Ok(warp::reply::with_status(
                     warp::reply::json(&api_response),
@@ -95,16 +183,33 @@ async fn start_session_handler(
 }
 
 async fn reply_session_handler(
-    req: SessionRequest,
+    req: SessionReplyRequest,
     _api_key: String,
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Replying to session with prompt: {}", req.prompt);
-    
-    let agent = AGENT.lock().await;
-    
-    // Create a user message with the prompt
-    let messages = vec![Message::user().with_text(&req.prompt)];
-    
+
+    let mut agent = AGENT.lock().await;
+
+    // Retrieve existing session history
+    let mut history = SESSION_HISTORY.lock().await;
+    let entry = match history.get_mut(&req.session_id) {
+        Some(messages) => messages,
+        None => {
+            let response = ApiResponse {
+                message: "Session not found".to_string(),
+                status: "error".to_string(),
+            };
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&response),
+                warp::http::StatusCode::NOT_FOUND,
+            ));
+        }
+    };
+
+    // Append the new user message
+    entry.push(Message::user().with_text(&req.prompt));
+    let messages = entry.clone();
+
     // Process the messages through the agent
     let result = agent.reply(&messages, None).await;
     
@@ -113,6 +218,8 @@ async fn reply_session_handler(
             // Process the stream to get the first response
             if let Ok(Some(response)) = stream.try_next().await {
                 let response_text = response.as_concat_text();
+                // store assistant response in history
+                entry.push(response);
                 let api_response = ApiResponse {
                     message: format!("Reply: {}", response_text),
                     status: "success".to_string(),
@@ -123,7 +230,7 @@ async fn reply_session_handler(
                 ))
             } else {
                 let api_response = ApiResponse {
-                    message: format!("Reply processed but no response generated"),
+                    message: "Reply processed but no response generated".to_string(),
                     status: "warning".to_string(),
                 };
                 Ok(warp::reply::with_status(
@@ -143,6 +250,32 @@ async fn reply_session_handler(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
+    }
+}
+
+async fn end_session_handler(
+    req: EndSessionRequest,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    let mut history = SESSION_HISTORY.lock().await;
+    if history.remove(&req.session_id).is_some() {
+        let response = ApiResponse {
+            message: "Session ended".to_string(),
+            status: "success".to_string(),
+        };
+        Ok(warp::reply::with_status(
+            warp::reply::json(&response),
+            warp::http::StatusCode::OK,
+        ))
+    } else {
+        let response = ApiResponse {
+            message: "Session not found".to_string(),
+            status: "error".to_string(),
+        };
+        Ok(warp::reply::with_status(
+            warp::reply::json(&response),
+            warp::http::StatusCode::NOT_FOUND,
+        ))
     }
 }
 
@@ -175,6 +308,128 @@ async fn get_provider_config_handler() -> Result<impl warp::Reply, Rejection> {
     
     let response = ProviderConfig { provider, model };
     Ok::<warp::reply::Json, warp::Rejection>(warp::reply::json(&response))
+}
+
+async fn add_extension_handler(
+    req: ExtensionConfigRequest,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Adding extension: {:?}", req);
+
+    #[cfg(target_os = "windows")]
+    if let ExtensionConfigRequest::Stdio { cmd, .. } = &req {
+        if cmd.ends_with("npx.cmd") || cmd.ends_with("npx") {
+            let node_exists = std::path::Path::new(r"C:\Program Files\nodejs\node.exe").exists()
+                || std::path::Path::new(r"C:\Program Files (x86)\nodejs\node.exe").exists();
+
+            if !node_exists {
+                let cmd_path = std::path::Path::new(cmd);
+                let script_dir = cmd_path.parent().ok_or_else(|| warp::reject())?;
+
+                let install_script = script_dir.join("install-node.cmd");
+
+                if install_script.exists() {
+                    eprintln!("Installing Node.js...");
+                    let output = std::process::Command::new(&install_script)
+                        .arg("https://nodejs.org/dist/v23.10.0/node-v23.10.0-x64.msi")
+                        .output()
+                        .map_err(|_| warp::reject())?;
+
+                    if !output.status.success() {
+                        eprintln!(
+                            "Failed to install Node.js: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        let resp = ExtensionResponse {
+                            error: true,
+                            message: Some(format!(
+                                "Failed to install Node.js: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            )),
+                        };
+                        return Ok(warp::reply::json(&resp));
+                    }
+                    eprintln!("Node.js installation completed");
+                } else {
+                    eprintln!(
+                        "Node.js installer script not found at: {}",
+                        install_script.display()
+                    );
+                    let resp = ExtensionResponse {
+                        error: true,
+                        message: Some("Node.js installer script not found".to_string()),
+                    };
+                    return Ok(warp::reply::json(&resp));
+                }
+            }
+        }
+    }
+
+    let extension = match req {
+        ExtensionConfigRequest::Sse { name, uri, envs, env_keys, timeout } => {
+            ExtensionConfig::Sse {
+                name,
+                uri,
+                envs,
+                env_keys,
+                description: None,
+                timeout,
+                bundled: None,
+            }
+        }
+        ExtensionConfigRequest::Stdio { name, cmd, args, envs, env_keys, timeout } => {
+            ExtensionConfig::Stdio {
+                name,
+                cmd,
+                args,
+                envs,
+                env_keys,
+                timeout,
+                description: None,
+                bundled: None,
+            }
+        }
+        ExtensionConfigRequest::Builtin { name, display_name, timeout } => {
+            ExtensionConfig::Builtin {
+                name,
+                display_name,
+                timeout,
+                bundled: None,
+            }
+        }
+        ExtensionConfigRequest::Frontend { name, tools, instructions } => {
+            ExtensionConfig::Frontend {
+                name,
+                tools,
+                instructions,
+                bundled: None,
+            }
+        }
+    };
+
+    let agent = AGENT.lock().await;
+    let result = agent.add_extension(extension).await;
+
+    let resp = match result {
+        Ok(_) => ExtensionResponse { error: false, message: None },
+        Err(e) => ExtensionResponse {
+            error: true,
+            message: Some(format!("Failed to add extension configuration, error: {:?}", e)),
+        },
+    };
+    Ok(warp::reply::json(&resp))
+}
+
+async fn remove_extension_handler(
+    name: String,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Removing extension: {}", name);
+    let agent = AGENT.lock().await;
+    agent.remove_extension(&name).await;
+
+    let resp = ExtensionResponse { error: false, message: None };
+    Ok(warp::reply::json(&resp))
 }
 
 fn with_api_key(api_key: String) -> impl Filter<Extract = (String,), Error = Rejection> + Clone {
@@ -334,19 +589,43 @@ async fn main() -> Result<(), anyhow::Error> {
         .and(with_api_key(api_key.clone()))
         .and_then(start_session_handler);
     
-    // Session reply endpoint 
+    // Session reply endpoint
     let reply_session = warp::path("session")
         .and(warp::path("reply"))
         .and(warp::post())
         .and(warp::body::json())
         .and(with_api_key(api_key.clone()))
         .and_then(reply_session_handler);
+
+    // Session end endpoint
+    let end_session = warp::path("session")
+        .and(warp::path("end"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(end_session_handler);
     
     // List extensions endpoint
     let list_extensions = warp::path("extensions")
         .and(warp::path("list"))
         .and(warp::get())
         .and_then(list_extensions_handler);
+
+    // Add extension endpoint
+    let add_extension = warp::path("extensions")
+        .and(warp::path("add"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(add_extension_handler);
+
+    // Remove extension endpoint
+    let remove_extension = warp::path("extensions")
+        .and(warp::path("remove"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(remove_extension_handler);
     
     // Get provider configuration endpoint
     let get_provider_config = warp::path("provider")
@@ -357,7 +636,10 @@ async fn main() -> Result<(), anyhow::Error> {
     // Combine all routes
     let routes = start_session
         .or(reply_session)
+        .or(end_session)
         .or(list_extensions)
+        .or(add_extension)
+        .or(remove_extension)
         .or(get_provider_config);
     
     // Get bind address from configuration or use default
