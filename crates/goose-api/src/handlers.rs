@@ -44,6 +44,11 @@ pub struct EndSessionRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SummarizeSessionRequest {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExtensionsResponse {
     pub extensions: Vec<String>,
 }
@@ -281,6 +286,67 @@ pub async fn end_session_handler(
             warp::reply::json(&response),
             warp::http::StatusCode::NOT_FOUND,
         ))
+    }
+}
+
+pub async fn summarize_session_handler(
+    req: SummarizeSessionRequest,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Summarizing session: {}", req.session_id);
+
+    let agent = AGENT.lock().await;
+
+    let session_name = req.session_id.to_string();
+    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+
+    let messages = match session::read_messages(&session_path) {
+        Ok(m) => m,
+        Err(_) => {
+            let response = ApiResponse {
+                message: "Session not found".to_string(),
+                status: "error".to_string(),
+            };
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&response),
+                warp::http::StatusCode::NOT_FOUND,
+            ));
+        }
+    };
+
+    let provider = agent.provider().await.ok();
+
+    match agent.summarize_context(&messages).await {
+        Ok((summarized_messages, _)) => {
+            let summary_text = summarized_messages
+                .first()
+                .map(|m| m.as_concat_text())
+                .unwrap_or_default();
+
+            if let Err(e) = session::persist_messages(&session_path, &summarized_messages, provider.clone()).await {
+                warn!("Failed to persist session {}: {}", session_name, e);
+            }
+
+            let resp = ApiResponse {
+                message: summary_text,
+                status: "success".to_string(),
+            };
+            Ok(warp::reply::with_status(
+                warp::reply::json(&resp),
+                warp::http::StatusCode::OK,
+            ))
+        }
+        Err(e) => {
+            error!("Failed to summarize session: {}", e);
+            let resp = ApiResponse {
+                message: format!("Failed to summarize session: {}", e),
+                status: "error".to_string(),
+            };
+            Ok(warp::reply::with_status(
+                warp::reply::json(&resp),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
     }
 }
 
