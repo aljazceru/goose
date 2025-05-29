@@ -122,6 +122,21 @@ impl Session {
         }
     }
 
+    /// Helper function to summarize context messages
+    async fn summarize_context_messages(
+        messages: &mut Vec<Message>,
+        agent: &Agent,
+        message_suffix: &str,
+    ) -> Result<()> {
+        // Summarize messages to fit within context length
+        let (summarized_messages, _) = agent.summarize_context(messages).await?;
+        let msg = format!("Context maxed out\n{}\n{}", "-".repeat(50), message_suffix);
+        output::render_text(&msg, Some(Color::Yellow), true);
+        *messages = summarized_messages;
+
+        Ok(())
+    }
+
     /// Add a stdio extension to the session
     ///
     /// # Arguments
@@ -290,6 +305,22 @@ impl Session {
         // Persist messages with provider for automatic description generation
         session::persist_messages(&self.session_file, &self.messages, Some(provider)).await?;
 
+        // Track the current directory and last instruction in projects.json
+        let session_id = self
+            .session_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        if let Err(e) =
+            crate::project_tracker::update_project_tracker(Some(&message), session_id.as_deref())
+        {
+            eprintln!(
+                "Warning: Failed to update project tracker with instruction: {}",
+                e
+            );
+        }
+
         self.process_agent_response(false).await?;
         Ok(())
     }
@@ -355,6 +386,20 @@ impl Session {
                             save_history(&mut editor);
 
                             self.messages.push(Message::user().with_text(&content));
+
+                            // Track the current directory and last instruction in projects.json
+                            let session_id = self
+                                .session_file
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string());
+
+                            if let Err(e) = crate::project_tracker::update_project_tracker(
+                                Some(&content),
+                                session_id.as_deref(),
+                            ) {
+                                eprintln!("Warning: Failed to update project tracker with instruction: {}", e);
+                            }
 
                             // Get the provider from the agent for description generation
                             let provider = self.agent.provider().await?;
@@ -505,6 +550,62 @@ impl Session {
 
                     continue;
                 }
+                InputResult::Summarize => {
+                    save_history(&mut editor);
+
+                    let prompt = "Are you sure you want to summarize this conversation? This will condense the message history.";
+                    let should_summarize =
+                        match cliclack::confirm(prompt).initial_value(true).interact() {
+                            Ok(choice) => choice,
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::Interrupted {
+                                    false // If interrupted, set should_summarize to false
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+                        };
+
+                    if should_summarize {
+                        println!("{}", console::style("Summarizing conversation...").yellow());
+                        output::show_thinking();
+
+                        // Get the provider for summarization
+                        let provider = self.agent.provider().await?;
+
+                        // Call the summarize_context method which uses the summarize_messages function
+                        let (summarized_messages, _) =
+                            self.agent.summarize_context(&self.messages).await?;
+
+                        // Update the session messages with the summarized ones
+                        self.messages = summarized_messages;
+
+                        // Persist the summarized messages
+                        session::persist_messages(
+                            &self.session_file,
+                            &self.messages,
+                            Some(provider),
+                        )
+                        .await?;
+
+                        output::hide_thinking();
+                        println!(
+                            "{}",
+                            console::style("Conversation has been summarized.").green()
+                        );
+                        println!(
+                            "{}",
+                            console::style(
+                                "Key information has been preserved while reducing context length."
+                            )
+                            .green()
+                        );
+                    } else {
+                        println!("{}", console::style("Summarization cancelled.").yellow());
+                    }
+
+                    continue;
+                }
             }
         }
 
@@ -532,10 +633,21 @@ impl Session {
         match planner_response_type {
             PlannerResponseType::Plan => {
                 println!();
-                let should_act =
-                    cliclack::confirm("Do you want to clear message history & act on this plan?")
-                        .initial_value(true)
-                        .interact()?;
+                let should_act = match cliclack::confirm(
+                    "Do you want to clear message history & act on this plan?",
+                )
+                .initial_value(true)
+                .interact()
+                {
+                    Ok(choice) => choice,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            false // If interrupted, set should_act to false
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                };
                 if should_act {
                     output::render_act_on_plan();
                     self.run_mode = RunMode::Normal;
@@ -596,6 +708,7 @@ impl Session {
                     id: session_id.clone(),
                     working_dir: std::env::current_dir()
                         .expect("failed to get current session working directory"),
+                    schedule_id: None,
                 }),
             )
             .await?;
@@ -614,51 +727,99 @@ impl Session {
                                 let prompt = "Goose would like to call the above tool, do you allow?".to_string();
 
                                 // Get confirmation from user
-                                let permission = cliclack::select(prompt)
+                                let permission_result = cliclack::select(prompt)
                                     .item(Permission::AllowOnce, "Allow", "Allow the tool call once")
                                     .item(Permission::AlwaysAllow, "Always Allow", "Always allow the tool call")
                                     .item(Permission::DenyOnce, "Deny", "Deny the tool call")
-                                    .interact()?;
-                                self.agent.handle_confirmation(confirmation.id.clone(), PermissionConfirmation {
-                                    principal_type: PrincipalType::Tool,
-                                    permission,
-                                },).await;
+                                    .item(Permission::Cancel, "Cancel", "Cancel the AI response and tool call")
+                                    .interact();
+
+                                let permission = match permission_result {
+                                    Ok(p) => p, // If Ok, use the selected permission
+                                    Err(e) => {
+                                        // Check if the error is an interruption (Ctrl+C/Cmd+C, Escape)
+                                        if e.kind() == std::io::ErrorKind::Interrupted {
+                                            Permission::Cancel // If interrupted, set permission to Cancel
+                                        } else {
+                                            return Err(e.into()); // Otherwise, convert and propagate the original error
+                                        }
+                                    }
+                                };
+
+                                if permission == Permission::Cancel {
+                                    output::render_text("Tool call cancelled. Returning to chat...", Some(Color::Yellow), true);
+
+                                    let mut response_message = Message::user();
+                                    response_message.content.push(MessageContent::tool_response(
+                                        confirmation.id.clone(),
+                                        Err(ToolError::ExecutionError("Tool call cancelled by user".to_string()))
+                                    ));
+                                    self.messages.push(response_message);
+                                    session::persist_messages(&self.session_file, &self.messages, None).await?;
+
+                                    drop(stream);
+                                    break;
+                                } else {
+                                    self.agent.handle_confirmation(confirmation.id.clone(), PermissionConfirmation {
+                                        principal_type: PrincipalType::Tool,
+                                        permission,
+                                    },).await;
+                                }
                             } else if let Some(MessageContent::ContextLengthExceeded(_)) = message.content.first() {
                                 output::hide_thinking();
 
-                                let prompt = "The model's context length is maxed out. You will need to reduce the # msgs. Do you want to?".to_string();
-                                let selected = cliclack::select(prompt)
-                                    .item("clear", "Clear Session", "Removes all messages from Goose's memory")
-                                    .item("truncate", "Truncate Messages", "Removes old messages till context is within limits")
-                                    .item("summarize", "Summarize Session", "Summarize the session to reduce context length")
-                                    .interact()?;
+                                if interactive {
+                                    // In interactive mode, ask the user what to do
+                                    let prompt = "The model's context length is maxed out. You will need to reduce the # msgs. Do you want to?".to_string();
+                                    let selected_result = cliclack::select(prompt)
+                                        .item("clear", "Clear Session", "Removes all messages from Goose's memory")
+                                        .item("truncate", "Truncate Messages", "Removes old messages till context is within limits")
+                                        .item("summarize", "Summarize Session", "Summarize the session to reduce context length")
+                                        .item("cancel", "Cancel", "Cancel and return to chat")
+                                        .interact();
 
-                                match selected {
-                                    "clear" => {
-                                        self.messages.clear();
-                                        let msg = format!("Session cleared.\n{}", "-".repeat(50));
-                                        output::render_text(&msg, Some(Color::Yellow), true);
-                                        break;  // exit the loop to hand back control to the user
+                                    let selected = match selected_result {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                                "cancel" // If interrupted, set selected to cancel
+                                            } else {
+                                                return Err(e.into());
+                                            }
+                                        }
+                                    };
+
+                                    match selected {
+                                        "clear" => {
+                                            self.messages.clear();
+                                            let msg = format!("Session cleared.\n{}", "-".repeat(50));
+                                            output::render_text(&msg, Some(Color::Yellow), true);
+                                            break;  // exit the loop to hand back control to the user
+                                        }
+                                        "truncate" => {
+                                            // Truncate messages to fit within context length
+                                            let (truncated_messages, _) = self.agent.truncate_context(&self.messages).await?;
+                                            let msg = format!("Context maxed out\n{}\nGoose tried its best to truncate messages for you.", "-".repeat(50));
+                                            output::render_text("", Some(Color::Yellow), true);
+                                            output::render_text(&msg, Some(Color::Yellow), true);
+                                            self.messages = truncated_messages;
+                                        }
+                                        "summarize" => {
+                                            // Use the helper function to summarize context
+                                            Self::summarize_context_messages(&mut self.messages, &self.agent, "Goose summarized messages for you.").await?;
+                                        }
+                                        "cancel" => {
+                                            break; // Return to main prompt
+                                        }
+                                        _ => {
+                                            unreachable!()
+                                        }
                                     }
-                                    "truncate" => {
-                                        // Truncate messages to fit within context length
-                                        let (truncated_messages, _) = self.agent.truncate_context(&self.messages).await?;
-                                        let msg = format!("Context maxed out\n{}\nGoose tried its best to truncate messages for you.", "-".repeat(50));
-                                        output::render_text("", Some(Color::Yellow), true);
-                                        output::render_text(&msg, Some(Color::Yellow), true);
-                                        self.messages = truncated_messages;
-                                    }
-                                    "summarize" => {
-                                        // Summarize messages to fit within context length
-                                        let (summarized_messages, _) = self.agent.summarize_context(&self.messages).await?;
-                                        let msg = format!("Context maxed out\n{}\nGoose summarized messages for you.", "-".repeat(50));
-                                        output::render_text(&msg, Some(Color::Yellow), true);
-                                        self.messages = summarized_messages;
-                                    }
-                                    _ => {
-                                        unreachable!()
-                                    }
+                                } else {
+                                    // In headless mode (goose run), automatically use summarize
+                                    Self::summarize_context_messages(&mut self.messages, &self.agent, "Goose automatically summarized messages to continue processing.").await?;
                                 }
+
                                 // Restart the stream after handling ContextLengthExceeded
                                 stream = self
                                     .agent
@@ -668,6 +829,7 @@ impl Session {
                                             id: session_id.clone(),
                                             working_dir: std::env::current_dir()
                                                 .expect("failed to get current session working directory"),
+                                            schedule_id: None,
                                         }),
                                     )
                                     .await?;
@@ -852,6 +1014,31 @@ impl Session {
         self.messages.clone()
     }
 
+    /// Render all past messages from the session history
+    pub fn render_message_history(&self) {
+        if self.messages.is_empty() {
+            return;
+        }
+
+        // Print session restored message
+        println!(
+            "\n{} {} messages loaded into context.",
+            console::style("Session restored:").green().bold(),
+            console::style(self.messages.len()).green()
+        );
+
+        // Render each message
+        for message in &self.messages {
+            output::render_message(message, self.debug);
+        }
+
+        // Add a visual separator after restored messages
+        println!(
+            "\n{}\n",
+            console::style("──────── New Messages ────────").dim()
+        );
+    }
+
     /// Get the session metadata
     pub fn get_metadata(&self) -> Result<session::SessionMetadata> {
         if !self.session_file.exists() {
@@ -976,29 +1163,30 @@ fn get_reasoner() -> Result<Arc<dyn Provider>, anyhow::Error> {
     use goose::model::ModelConfig;
     use goose::providers::create;
 
-    let (reasoner_provider, reasoner_model) = match (
-        std::env::var("GOOSE_PLANNER_PROVIDER"),
-        std::env::var("GOOSE_PLANNER_MODEL"),
-    ) {
-        (Ok(provider), Ok(model)) => (provider, model),
-        _ => {
-            println!(
-                "WARNING: GOOSE_PLANNER_PROVIDER or GOOSE_PLANNER_MODEL is not set. \
-                 Using default model from config..."
-            );
-            let config = Config::global();
-            let provider = config
-                .get_param("GOOSE_PROVIDER")
-                .expect("No provider configured. Run 'goose configure' first");
-            let model = config
-                .get_param("GOOSE_MODEL")
-                .expect("No model configured. Run 'goose configure' first");
-            (provider, model)
-        }
+    let config = Config::global();
+
+    // Try planner-specific provider first, fallback to default provider
+    let provider = if let Ok(provider) = config.get_param::<String>("GOOSE_PLANNER_PROVIDER") {
+        provider
+    } else {
+        println!("WARNING: GOOSE_PLANNER_PROVIDER not found. Using default provider...");
+        config
+            .get_param::<String>("GOOSE_PROVIDER")
+            .expect("No provider configured. Run 'goose configure' first")
     };
 
-    let model_config = ModelConfig::new(reasoner_model);
-    let reasoner = create(&reasoner_provider, model_config)?;
+    // Try planner-specific model first, fallback to default model
+    let model = if let Ok(model) = config.get_param::<String>("GOOSE_PLANNER_MODEL") {
+        model
+    } else {
+        println!("WARNING: GOOSE_PLANNER_MODEL not found. Using default model...");
+        config
+            .get_param::<String>("GOOSE_MODEL")
+            .expect("No model configured. Run 'goose configure' first")
+    };
+
+    let model_config = ModelConfig::new(model);
+    let reasoner = create(&provider, model_config)?;
 
     Ok(reasoner)
 }

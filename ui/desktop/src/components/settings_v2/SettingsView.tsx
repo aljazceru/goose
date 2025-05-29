@@ -4,8 +4,11 @@ import type { View, ViewOptions } from '../../App';
 import ExtensionsSection from './extensions/ExtensionsSection';
 import ModelsSection from './models/ModelsSection';
 import { ModeSection } from './mode/ModeSection';
+import { ToolSelectionStrategySection } from './tool_selection_strategy/ToolSelectionStrategySection';
 import SessionSharingSection from './sessions/SessionSharingSection';
+import { ResponseStylesSection } from './response_styles/ResponseStylesSection';
 import { ExtensionConfig } from '../../api';
+import MoreMenuLayout from '../more_menu/MoreMenuLayout';
 
 export type SettingsViewOptions = {
   deepLinkConfig?: ExtensionConfig;
@@ -23,7 +26,7 @@ export default function SettingsView({
 }) {
   return (
     <div className="h-screen w-full animate-[fadein_200ms_ease-in_forwards]">
-      <div className="relative flex items-center h-[36px] w-full bg-bgSubtle"></div>
+      <MoreMenuLayout showMenu={false} />
 
       <ScrollArea className="h-full w-full">
         <div className="flex flex-col pb-24">
@@ -46,6 +49,10 @@ export default function SettingsView({
               <ModeSection setView={setView} />
               {/*Session sharing*/}
               <SessionSharingSection />
+              {/* Response Styles */}
+              <ResponseStylesSection />
+              {/* Tool Selection Strategy */}
+              <ToolSelectionStrategySection setView={setView} />
             </div>
           </div>
         </div>

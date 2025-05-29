@@ -1,4 +1,4 @@
-import Electron, { contextBridge, ipcRenderer } from 'electron';
+import Electron, { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 interface RecipeConfig {
   id: string;
@@ -21,10 +21,17 @@ interface FileResponse {
   found: boolean;
 }
 
+interface SaveDataUrlResponse {
+  id: string;
+  filePath?: string;
+  error?: string;
+}
+
 const config = JSON.parse(process.argv.find((arg) => arg.startsWith('{')) || '{}');
 
 // Define the API types in a single place
 type ElectronAPI = {
+  platform: string;
   reactReady: () => void;
   getConfig: () => Record<string, unknown>;
   hideWindow: () => void;
@@ -43,13 +50,14 @@ type ElectronAPI = {
   fetchMetadata: (url: string) => Promise<string>;
   reloadApp: () => void;
   checkForOllama: () => Promise<boolean>;
-  selectFileOrDirectory: () => Promise<string>;
+  selectFileOrDirectory: () => Promise<string | null>;
   startPowerSaveBlocker: () => Promise<number>;
   stopPowerSaveBlocker: () => Promise<void>;
   getBinaryPath: (binaryName: string) => Promise<string>;
   readFile: (directory: string) => Promise<FileResponse>;
   writeFile: (directory: string, content: string) => Promise<boolean>;
   getAllowedExtensions: () => Promise<string[]>;
+  getPathForFile: (file: File) => string;
   on: (
     channel: string,
     callback: (event: Electron.IpcRendererEvent, ...args: unknown[]) => void
@@ -59,6 +67,11 @@ type ElectronAPI = {
     callback: (event: Electron.IpcRendererEvent, ...args: unknown[]) => void
   ) => void;
   emit: (channel: string, ...args: unknown[]) => void;
+  // Functions for image pasting
+  saveDataUrlToTemp: (dataUrl: string, uniqueId: string) => Promise<SaveDataUrlResponse>;
+  deleteTempFile: (filePath: string) => void;
+  // Function to serve temp images
+  getTempImage: (filePath: string) => Promise<string | null>;
 };
 
 type AppConfigAPI = {
@@ -67,6 +80,7 @@ type AppConfigAPI = {
 };
 
 const electronAPI: ElectronAPI = {
+  platform: process.platform,
   reactReady: () => ipcRenderer.send('react-ready'),
   getConfig: () => config,
   hideWindow: () => ipcRenderer.send('hide-window'),
@@ -101,6 +115,7 @@ const electronAPI: ElectronAPI = {
   readFile: (filePath: string) => ipcRenderer.invoke('read-file', filePath),
   writeFile: (filePath: string, content: string) =>
     ipcRenderer.invoke('write-file', filePath, content),
+  getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getAllowedExtensions: () => ipcRenderer.invoke('get-allowed-extensions'),
   on: (
     channel: string,
@@ -116,6 +131,15 @@ const electronAPI: ElectronAPI = {
   },
   emit: (channel: string, ...args: unknown[]) => {
     ipcRenderer.emit(channel, ...args);
+  },
+  saveDataUrlToTemp: (dataUrl: string, uniqueId: string): Promise<SaveDataUrlResponse> => {
+    return ipcRenderer.invoke('save-data-url-to-temp', dataUrl, uniqueId);
+  },
+  deleteTempFile: (filePath: string): void => {
+    ipcRenderer.send('delete-temp-file', filePath);
+  },
+  getTempImage: (filePath: string): Promise<string | null> => {
+    return ipcRenderer.invoke('get-temp-image', filePath);
   },
 };
 
