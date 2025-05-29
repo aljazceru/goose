@@ -23,3 +23,7 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["serde", "v4"] }
 dashmap = "6"
  # Add dynamic-library for extension loading
+
+[dev-dependencies]
+tempfile = "3"
+async-trait = "0.1"

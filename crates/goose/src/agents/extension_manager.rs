@@ -17,7 +17,7 @@ use crate::agents::extension::Envs;
 use crate::config::{Config, ExtensionConfigManager};
 use crate::prompt_template;
 use mcp_client::client::{ClientCapabilities, ClientInfo, McpClient, McpClientTrait};
-use mcp_client::transport::{SseTransport, StdioTransport, Transport};
+use mcp_client::transport::{PendingRequests, SseTransport, StdioTransport, Transport};
 use mcp_core::{prompt::Prompt, Content, Tool, ToolCall, ToolError, ToolResult};
 use serde_json::Value;
 
@@ -33,6 +33,7 @@ pub struct ExtensionManager {
     clients: HashMap<String, McpClientBox>,
     instructions: HashMap<String, String>,
     resource_capable_extensions: HashSet<String>,
+    pending_requests: HashMap<String, Arc<PendingRequests>>, // track pending requests per extension
 }
 
 /// A flattened representation of a resource used by the agent to prepare inference
@@ -103,6 +104,7 @@ impl ExtensionManager {
             clients: HashMap::new(),
             instructions: HashMap::new(),
             resource_capable_extensions: HashSet::new(),
+            pending_requests: HashMap::new(),
         }
     }
 
@@ -183,12 +185,14 @@ impl ExtensionManager {
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
                 let transport = SseTransport::new(uri, all_envs);
                 let handle = transport.start().await?;
+                let pending = handle.pending_requests();
                 let service = McpService::with_timeout(
                     handle,
                     Duration::from_secs(
                         timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                     ),
                 );
+                self.pending_requests.insert(sanitized_name.clone(), pending);
                 Box::new(McpClient::new(service))
             }
             ExtensionConfig::Stdio {
@@ -202,12 +206,14 @@ impl ExtensionManager {
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
                 let transport = StdioTransport::new(cmd, args.to_vec(), all_envs);
                 let handle = transport.start().await?;
+                let pending = handle.pending_requests();
                 let service = McpService::with_timeout(
                     handle,
                     Duration::from_secs(
                         timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                     ),
                 );
+                self.pending_requests.insert(sanitized_name.clone(), pending);
                 Box::new(McpClient::new(service))
             }
             ExtensionConfig::Builtin {
@@ -227,12 +233,14 @@ impl ExtensionManager {
                     HashMap::new(),
                 );
                 let handle = transport.start().await?;
+                let pending = handle.pending_requests();
                 let service = McpService::with_timeout(
                     handle,
                     Duration::from_secs(
                         timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                     ),
                 );
+                self.pending_requests.insert(sanitized_name.clone(), pending);
                 Box::new(McpClient::new(service))
             }
             _ => unreachable!(),
@@ -285,7 +293,17 @@ impl ExtensionManager {
         self.clients.remove(&sanitized_name);
         self.instructions.remove(&sanitized_name);
         self.resource_capable_extensions.remove(&sanitized_name);
+        self.pending_requests.remove(&sanitized_name);
         Ok(())
+    }
+
+    /// Get the size of each extension's pending request map
+    pub async fn pending_request_sizes(&self) -> HashMap<String, usize> {
+        let mut result = HashMap::new();
+        for (name, pending) in &self.pending_requests {
+            result.insert(name.clone(), pending.len().await);
+        }
+        result
     }
 
     pub async fn suggest_disable_extensions_prompt(&self) -> Value {

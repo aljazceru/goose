@@ -236,6 +236,53 @@ By default, the server runs on `127.0.0.1:8080`. You can modify this using confi
 }
 ```
 
+### 7. Summarize Session
+
+**Endpoint**: `POST /session/summarize`
+
+**Description**: Summarizes the full conversation for a given session.
+
+**Request**:
+- Headers:
+  - Content-Type: application/json
+  - x-api-key: [your-api-key]
+- Body:
+```json
+{
+  "session_id": "<uuid>"
+}
+```
+
+**Response**:
+```json
+{
+  "message": "<summarized conversation>",
+  "status": "success"
+=======
+### 7. Metrics
+
+**Endpoint**: `GET /metrics`
+
+**Description**: Returns runtime metrics about stored sessions and extensions.
+
+**Request**:
+- Headers:
+  - `x-api-key: [your-api-key]`
+
+**Response** (example):
+```json
+{
+  "session_messages": {
+    "20240605_001234": 3,
+    "20240605_010000": 5
+  },
+  "active_sessions": 2,
+  "pending_requests": {
+    "mcp_say": 0
+  }
+}
+```
+
 ## Session Management
 
 Sessions created via the API are stored in the same location as the CLI
@@ -279,6 +326,12 @@ curl -X POST http://localhost:8080/extensions/remove \
 # Get provider configuration
 curl -X GET http://localhost:8080/provider/config \
   -H "x-api-key: your_secure_api_key"
+
+# Summarize a session
+curl -X POST http://localhost:8080/session/summarize \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your_secure_api_key" \
+  -d '{"session_id": "your-session-id"}'
 ```
 
 ### Using Python
@@ -331,6 +384,14 @@ print(response.json())
 
 # Get provider configuration
 response = requests.get(f"{API_URL}/provider/config", headers=HEADERS)
+print(response.json())
+
+# Summarize a session
+response = requests.post(
+    f"{API_URL}/session/summarize",
+    headers=HEADERS,
+    json={"session_id": "your-session-id"}
+)
 print(response.json())
 ```
 
