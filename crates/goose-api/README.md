@@ -28,15 +28,19 @@ cargo build --release
 
 ## Configuration
 
-Goose API supports configuration through both environment variables and a configuration file. The precedence order is:
+Goose API supports configuration via environment variables and configuration files.
+The precedence order is:
 
 1. Environment variables (highest priority)
-2. Configuration file (lower priority)
-3. Default values (lowest priority)
+2. Goose CLI configuration file (usually `~/.config/goose/config.yaml`) if it exists
+3. `config` file shipped with the crate
+4. Default values (lowest priority)
 
 ### Configuration File
 
-Create a file named `config` (with no extension) in the directory where you run the goose-api. The format can be JSON, YAML, TOML, etc. (the `config` crate will detect the format automatically).
+If no CLI configuration file is found, goose-api looks for a `config` file in its
+crate directory. This file has no extension and can be JSON, YAML, TOML, etc.
+The `config` crate will detect the format automatically.
 
 Example `config` file (YAML format):
 

@@ -8,7 +8,23 @@ use config::{builder::DefaultState, ConfigBuilder, Environment, File};
 use serde_json::Value;
 
 pub fn load_configuration() -> std::result::Result<config::Config, config::ConfigError> {
-    let config_path = std::env::var("GOOSE_CONFIG").unwrap_or_else(|_| "config".to_string());
+    // Determine the configuration file based on priority:
+    // 1. Explicit GOOSE_CONFIG env var
+    // 2. Goose CLI config if it exists
+    // 3. Fallback to config file packaged with goose-api
+
+    let config_path = if let Ok(path) = std::env::var("GOOSE_CONFIG") {
+        path
+    } else {
+        let global = Config::global();
+        if global.exists() {
+            global.path()
+        } else {
+            // Use the config file that ships with goose-api
+            format!("{}/config", env!("CARGO_MANIFEST_DIR"))
+        }
+    };
+
     let builder = ConfigBuilder::<DefaultState>::default()
         .add_source(File::with_name(&config_path).required(false))
         .add_source(Environment::with_prefix("GOOSE_API"));

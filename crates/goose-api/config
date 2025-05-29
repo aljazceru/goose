@@ -1,0 +1,8 @@
+# API server configuration
+host: 0.0.0.0
+port: 8080
+api_key: kurac
+
+# Provider configuration
+provider: ollama
+model: qwen3:8b
