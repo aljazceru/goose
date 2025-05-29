@@ -70,10 +70,39 @@ pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
                     global_config.get_param(&key.name)
                 };
 
-                if result.is_err() && key.required {
-                    error!("Required key {} not provided", key.name);
-                    return Err(anyhow::anyhow!("Required key {} not provided", key.name));
+                match result {
+                    Ok(value) => {
+                        if key.secret {
+                            config.set_secret(&key.name, Value::String(value))?;
+                        } else {
+                            config.set_param(&key.name, Value::String(value))?;
+                        }
+                        info!("Loaded {} from CLI config", key.name);
+                    }
+                    Err(_) => {
+                        if let Some(default) = &key.default {
+                            if key.secret {
+                                config.set_secret(&key.name, Value::String(default.clone()))?;
+                            } else {
+                                config.set_param(&key.name, Value::String(default.clone()))?;
+                            }
+                            info!("Using default for {}", key.name);
+                        } else if key.required {
+                            error!("Required key {} not provided", key.name);
+                            return Err(anyhow::anyhow!("Required key {} not provided", key.name));
+                        } else {
+                            warn!("Environment variable not set for key: {}", key.name);
+                        }
+                    }
                 }
+            } else if let Some(default) = &key.default {
+                if key.secret {
+                    config.set_secret(&key.name, Value::String(default.clone()))?;
+                } else {
+                    config.set_param(&key.name, Value::String(default.clone()))?;
+                }
+                info!("Using default for {}", key.name);
+
             } else if key.required {
                 error!("Required key {} not provided", key.name);
                 return Err(anyhow::anyhow!("Required key {} not provided", key.name));
