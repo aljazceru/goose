@@ -119,6 +119,7 @@ pub async fn start_session_handler(
             Some(SessionConfig {
                 id: Identifier::Name(session_name.clone()),
                 working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                schedule_id: None,
             }),
         )
         .await;
@@ -206,6 +207,7 @@ pub async fn reply_session_handler(
             Some(SessionConfig {
                 id: Identifier::Name(session_name.clone()),
                 working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                schedule_id: None,
             }),
         )
         .await;
