@@ -18,13 +18,31 @@ pub fn load_configuration() -> std::result::Result<config::Config, config::Confi
 pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
     let api_config = load_configuration()?;
 
-    let provider_name = std::env::var("GOOSE_API_PROVIDER")
-        .or_else(|_| api_config.get_string("provider"))
-        .unwrap_or_else(|_| "openai".to_string());
+    let global_config = Config::global();
 
-    let model_name = std::env::var("GOOSE_API_MODEL")
-        .or_else(|_| api_config.get_string("model"))
-        .unwrap_or_else(|_| "gpt-4o".to_string());
+    let provider_name = if let Ok(val) = std::env::var("GOOSE_API_PROVIDER") {
+        val
+    } else if let Ok(val) = api_config.get_string("provider") {
+        val
+    } else if global_config.exists() {
+        global_config
+            .get_param::<String>("GOOSE_PROVIDER")
+            .unwrap_or_else(|_| "openai".to_string())
+    } else {
+        "openai".to_string()
+    };
+
+    let model_name = if let Ok(val) = std::env::var("GOOSE_API_MODEL") {
+        val
+    } else if let Ok(val) = api_config.get_string("model") {
+        val
+    } else if global_config.exists() {
+        global_config
+            .get_param::<String>("GOOSE_MODEL")
+            .unwrap_or_else(|_| "gpt-4o".to_string())
+    } else {
+        "gpt-4o".to_string()
+    };
 
     info!("Initializing with provider: {}, model: {}", provider_name, model_name);
 
@@ -44,12 +62,49 @@ pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
                     config.set_param(&key.name, Value::String(value))?;
                     info!("Set parameter: {}", key.name);
                 }
-            } else {
-                warn!("Environment variable not set for key: {}", key.name);
-                if key.required {
-                    error!("Required key {} not provided", key.name);
-                    return Err(anyhow::anyhow!("Required key {} not provided", key.name));
+            } else if global_config.exists() {
+                // If not provided via environment, try existing CLI config
+                let result: Result<String, _> = if key.secret {
+                    global_config.get_secret(&key.name)
+                } else {
+                    global_config.get_param(&key.name)
+                };
+
+                match result {
+                    Ok(value) => {
+                        if key.secret {
+                            config.set_secret(&key.name, Value::String(value))?;
+                        } else {
+                            config.set_param(&key.name, Value::String(value))?;
+                        }
+                        info!("Loaded {} from CLI config", key.name);
+                    }
+                    Err(_) => {
+                        if let Some(default) = &key.default {
+                            if key.secret {
+                                config.set_secret(&key.name, Value::String(default.clone()))?;
+                            } else {
+                                config.set_param(&key.name, Value::String(default.clone()))?;
+                            }
+                            info!("Using default for {}", key.name);
+                        } else if key.required {
+                            error!("Required key {} not provided", key.name);
+                            return Err(anyhow::anyhow!("Required key {} not provided", key.name));
+                        } else {
+                            warn!("Environment variable not set for key: {}", key.name);
+                        }
+                    }
                 }
+            } else if let Some(default) = &key.default {
+                if key.secret {
+                    config.set_secret(&key.name, Value::String(default.clone()))?;
+                } else {
+                    config.set_param(&key.name, Value::String(default.clone()))?;
+                }
+                info!("Using default for {}", key.name);
+            } else if key.required {
+                error!("Required key {} not provided", key.name);
+                return Err(anyhow::anyhow!("Required key {} not provided", key.name));
             }
         }
     }
