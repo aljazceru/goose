@@ -4,7 +4,8 @@ use tracing::{info, warn, error};
 use crate::handlers::{
     add_extension_handler, end_session_handler, get_provider_config_handler,
     list_extensions_handler, remove_extension_handler, reply_session_handler,
-    start_session_handler, metrics_handler, with_api_key,
+    start_session_handler, summarize_session_handler, with_api_key,
+
 };
 use crate::config::{
     initialize_extensions, initialize_provider_config, load_configuration,
@@ -25,6 +26,13 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
         .and(warp::body::json())
         .and(with_api_key(api_key.clone()))
         .and_then(reply_session_handler);
+
+    let summarize_session = warp::path("session")
+        .and(warp::path("summarize"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(summarize_session_handler);
 
     let end_session = warp::path("session")
         .and(warp::path("end"))
@@ -63,6 +71,7 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
 
     start_session
         .or(reply_session)
+        .or(summarize_session)
         .or(end_session)
         .or(list_extensions)
         .or(add_extension)
