@@ -102,6 +102,7 @@ pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
                     config.set_param(&key.name, Value::String(default.clone()))?;
                 }
                 info!("Using default for {}", key.name);
+
             } else if key.required {
                 error!("Required key {} not provided", key.name);
                 return Err(anyhow::anyhow!("Required key {} not provided", key.name));
