@@ -10,6 +10,7 @@ use goose::message::Message;
 use goose::session::{self, Identifier};
 use goose::config::Config;
 use std::sync::LazyLock;
+use std::collections::HashMap;
 
 pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| ExtensionManager::default());
 pub static AGENT: LazyLock<tokio::sync::Mutex<Agent>> = LazyLock::new(|| tokio::sync::Mutex::new(Agent::new()));
@@ -58,6 +59,13 @@ pub struct ProviderConfig {
 pub struct ExtensionResponse {
     pub error: bool,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MetricsResponse {
+    pub session_messages: HashMap<String, usize>,
+    pub active_sessions: usize,
+    pub pending_requests: HashMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +447,33 @@ pub async fn remove_extension_handler(
             message: Some(format!("Failed to remove extension, error: {:?}", e)),
         },
     };
+    Ok(warp::reply::json(&resp))
+}
+
+pub async fn metrics_handler() -> Result<impl warp::Reply, Rejection> {
+    // Gather session message counts
+    let mut session_messages = HashMap::new();
+    if let Ok(sessions) = session::list_sessions() {
+        for (name, path) in sessions {
+            if let Ok(messages) = session::read_messages(&path) {
+                session_messages.insert(name, messages.len());
+            }
+        }
+    }
+
+    let active_sessions = session_messages.len();
+
+    // Gather pending request sizes for each extension
+    let pending_requests = EXTENSION_MANAGER
+        .pending_request_sizes()
+        .await;
+
+    let resp = MetricsResponse {
+        session_messages,
+        active_sessions,
+        pending_requests,
+    };
+
     Ok(warp::reply::json(&resp))
 }
 

@@ -236,6 +236,30 @@ By default, the server runs on `127.0.0.1:8080`. You can modify this using confi
 }
 ```
 
+### 7. Metrics
+
+**Endpoint**: `GET /metrics`
+
+**Description**: Returns runtime metrics about stored sessions and extensions.
+
+**Request**:
+- Headers:
+  - `x-api-key: [your-api-key]`
+
+**Response** (example):
+```json
+{
+  "session_messages": {
+    "20240605_001234": 3,
+    "20240605_010000": 5
+  },
+  "active_sessions": 2,
+  "pending_requests": {
+    "mcp_say": 0
+  }
+}
+```
+
 ## Session Management
 
 Sessions created via the API are stored in the same location as the CLI

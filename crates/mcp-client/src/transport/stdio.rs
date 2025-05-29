@@ -189,6 +189,7 @@ impl StdioActor {
 pub struct StdioTransportHandle {
     sender: mpsc::Sender<TransportMessage>,
     error_receiver: Arc<Mutex<mpsc::Receiver<Error>>>,
+    pending_requests: Arc<PendingRequests>,
 }
 
 #[async_trait::async_trait]
@@ -211,6 +212,10 @@ impl StdioTransportHandle {
             }
             Err(_) => Ok(()),
         }
+    }
+
+    pub fn pending_requests(&self) -> Arc<PendingRequests> {
+        Arc::clone(&self.pending_requests)
     }
 }
 
@@ -292,9 +297,10 @@ impl Transport for StdioTransport {
         let (message_tx, message_rx) = mpsc::channel(32);
         let (error_tx, error_rx) = mpsc::channel(1);
 
+        let pending_requests = Arc::new(PendingRequests::new());
         let actor = StdioActor {
             receiver: Some(message_rx),
-            pending_requests: Arc::new(PendingRequests::new()),
+            pending_requests: pending_requests.clone(),
             process,
             error_sender: error_tx,
             stdin: Some(stdin),
@@ -307,6 +313,7 @@ impl Transport for StdioTransport {
         let handle = StdioTransportHandle {
             sender: message_tx,
             error_receiver: Arc::new(Mutex::new(error_rx)),
+            pending_requests,
         };
         Ok(handle)
     }
