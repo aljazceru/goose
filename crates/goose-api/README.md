@@ -232,6 +232,13 @@ By default, the server runs on `127.0.0.1:8080`. You can modify this using confi
 }
 ```
 
+## Session Management
+
+Sessions created via the API are stored in the same location as the CLI
+(`~/.local/share/goose/sessions` on most platforms). Each session is saved to a
+`<session_id>.jsonl` file. You can resume or inspect these sessions with the CLI
+by providing the session ID returned from the API.
+
 ## Examples
 
 ### Using cURL

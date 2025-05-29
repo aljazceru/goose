@@ -10,8 +10,11 @@ use goose::agents::{
     ExtensionConfig,
 };
 use mcp_core::tool::Tool;
-use std::collections::HashMap;
 use uuid::Uuid;
+use goose::session::{self, Identifier};
+use goose::agents::SessionConfig;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use goose::providers::{create, providers};
 use goose::model::ModelConfig;
@@ -29,10 +32,6 @@ static AGENT: LazyLock<tokio::sync::Mutex<Agent>> = LazyLock::new(|| {
     tokio::sync::Mutex::new(Agent::new())
 });
 
-// Global store for session histories
-static SESSION_HISTORY: LazyLock<tokio::sync::Mutex<HashMap<Uuid, Vec<Message>>>> = LazyLock::new(|| {
-    tokio::sync::Mutex::new(HashMap::new())
-});
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRequest {
@@ -132,8 +131,20 @@ async fn start_session_handler(
 
     // Generate a new session ID and process the messages
     let session_id = Uuid::new_v4();
+    let session_name = session_id.to_string();
+    let session_path = session::get_path(Identifier::Name(session_name.clone()));
 
-    let result = agent.reply(&messages, None).await;
+    let provider = agent.provider().await.ok();
+
+    let result = agent
+        .reply(
+            &messages,
+            Some(SessionConfig {
+                id: Identifier::Name(session_name.clone()),
+                working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            }),
+        )
+        .await;
 
     match result {
         Ok(mut stream) => {
@@ -141,8 +152,9 @@ async fn start_session_handler(
             if let Ok(Some(response)) = stream.try_next().await {
                 let response_text = response.as_concat_text();
                 messages.push(response);
-                let mut history = SESSION_HISTORY.lock().await;
-                history.insert(session_id, messages);
+                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                    warn!("Failed to persist session {}: {}", session_name, e);
+                }
 
                 let api_response = StartSessionResponse {
                     message: response_text,
@@ -154,8 +166,9 @@ async fn start_session_handler(
                     warp::http::StatusCode::OK,
                 ))
             } else {
-                let mut history = SESSION_HISTORY.lock().await;
-                history.insert(session_id, messages);
+                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                    warn!("Failed to persist session {}: {}", session_name, e);
+                }
 
                 let api_response = StartSessionResponse {
                     message: "Session started but no response generated".to_string(),
@@ -190,11 +203,13 @@ async fn reply_session_handler(
 
     let mut agent = AGENT.lock().await;
 
-    // Retrieve existing session history
-    let mut history = SESSION_HISTORY.lock().await;
-    let entry = match history.get_mut(&req.session_id) {
-        Some(messages) => messages,
-        None => {
+    let session_name = req.session_id.to_string();
+    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+
+    // Retrieve existing session history from disk
+    let mut messages = match session::read_messages(&session_path) {
+        Ok(m) => m,
+        Err(_) => {
             let response = ApiResponse {
                 message: "Session not found".to_string(),
                 status: "error".to_string(),
@@ -207,19 +222,30 @@ async fn reply_session_handler(
     };
 
     // Append the new user message
-    entry.push(Message::user().with_text(&req.prompt));
-    let messages = entry.clone();
+    messages.push(Message::user().with_text(&req.prompt));
+
+    let provider = agent.provider().await.ok();
 
     // Process the messages through the agent
-    let result = agent.reply(&messages, None).await;
+    let result = agent
+        .reply(
+            &messages,
+            Some(SessionConfig {
+                id: Identifier::Name(session_name.clone()),
+                working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            }),
+        )
+        .await;
     
     match result {
         Ok(mut stream) => {
             // Process the stream to get the first response
             if let Ok(Some(response)) = stream.try_next().await {
                 let response_text = response.as_concat_text();
-                // store assistant response in history
-                entry.push(response);
+                messages.push(response);
+                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                    warn!("Failed to persist session {}: {}", session_name, e);
+                }
                 let api_response = ApiResponse {
                     message: format!("Reply: {}", response_text),
                     status: "success".to_string(),
@@ -229,6 +255,9 @@ async fn reply_session_handler(
                     warp::http::StatusCode::OK,
                 ))
             } else {
+                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                    warn!("Failed to persist session {}: {}", session_name, e);
+                }
                 let api_response = ApiResponse {
                     message: "Reply processed but no response generated".to_string(),
                     status: "warning".to_string(),
@@ -257,8 +286,10 @@ async fn end_session_handler(
     req: EndSessionRequest,
     _api_key: String,
 ) -> Result<impl warp::Reply, Rejection> {
-    let mut history = SESSION_HISTORY.lock().await;
-    if history.remove(&req.session_id).is_some() {
+    let session_name = req.session_id.to_string();
+    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+
+    if std::fs::remove_file(&session_path).is_ok() {
         let response = ApiResponse {
             message: "Session ended".to_string(),
             status: "success".to_string(),
