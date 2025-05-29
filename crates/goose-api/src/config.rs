@@ -1,4 +1,4 @@
-use crate::handlers::{AGENT, EXTENSION_MANAGER};
+use crate::handlers::AGENT;
 use goose::config::{Config, ExtensionEntry};
 use goose::agents::ExtensionConfig;
 use goose::providers::{create, providers};
@@ -72,7 +72,7 @@ pub async fn initialize_extensions(config: &config::Config) -> Result<(), anyhow
 
             if entry.enabled {
                 let extension_config: ExtensionConfig = entry.config;
-                let mut agent = AGENT.lock().await;
+                let agent = AGENT.lock().await;
                 if let Err(e) = agent.add_extension(extension_config).await {
                     error!("Failed to add extension {}: {}", name, e);
                 }

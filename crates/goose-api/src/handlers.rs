@@ -8,7 +8,7 @@ use mcp_core::tool::Tool;
 use goose::agents::{extension::Envs, extension_manager::ExtensionManager, ExtensionConfig, Agent, SessionConfig};
 use goose::message::Message;
 use goose::session::{self, Identifier};
-use goose::config::{Config, ExtensionEntry};
+use goose::config::Config;
 use std::sync::LazyLock;
 
 pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| ExtensionManager::default());
@@ -105,7 +105,7 @@ pub async fn start_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Starting session with prompt: {}", req.prompt);
 
-    let mut agent = AGENT.lock().await;
+    let agent = AGENT.lock().await;
     let mut messages = vec![Message::user().with_text(&req.prompt)];
     let session_id = Uuid::new_v4();
     let session_name = session_id.to_string();
@@ -177,7 +177,7 @@ pub async fn reply_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Replying to session with prompt: {}", req.prompt);
 
-    let mut agent = AGENT.lock().await;
+    let agent = AGENT.lock().await;
 
     let session_name = req.session_id.to_string();
     let session_path = session::get_path(Identifier::Name(session_name.clone()));
