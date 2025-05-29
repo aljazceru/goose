@@ -8,6 +8,7 @@ use goose::providers::{
 };
 use mcp_core::content::Content;
 use mcp_core::tool::Tool;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -352,6 +353,7 @@ where
 }
 
 #[tokio::test]
+#[serial]
 async fn test_openai_provider() -> Result<()> {
     test_provider(
         "OpenAI",
@@ -363,6 +365,7 @@ async fn test_openai_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_azure_provider() -> Result<()> {
     test_provider(
         "Azure",
@@ -378,6 +381,7 @@ async fn test_azure_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_bedrock_provider_long_term_credentials() -> Result<()> {
     test_provider(
         "Bedrock",
@@ -389,6 +393,7 @@ async fn test_bedrock_provider_long_term_credentials() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_bedrock_provider_aws_profile_credentials() -> Result<()> {
     let env_mods = HashMap::from_iter([
         // Ensure to unset long-term credentials to use AWS Profile provider
@@ -406,6 +411,7 @@ async fn test_bedrock_provider_aws_profile_credentials() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_databricks_provider() -> Result<()> {
     test_provider(
         "Databricks",
@@ -417,6 +423,7 @@ async fn test_databricks_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_databricks_provider_oauth() -> Result<()> {
     let mut env_mods = HashMap::new();
     env_mods.insert("DATABRICKS_TOKEN", None);
@@ -431,6 +438,7 @@ async fn test_databricks_provider_oauth() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_ollama_provider() -> Result<()> {
     test_provider(
         "Ollama",
@@ -442,11 +450,13 @@ async fn test_ollama_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_groq_provider() -> Result<()> {
     test_provider("Groq", &["GROQ_API_KEY"], None, groq::GroqProvider::default).await
 }
 
 #[tokio::test]
+#[serial]
 async fn test_anthropic_provider() -> Result<()> {
     test_provider(
         "Anthropic",
@@ -458,6 +468,7 @@ async fn test_anthropic_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_openrouter_provider() -> Result<()> {
     test_provider(
         "OpenRouter",
@@ -469,6 +480,7 @@ async fn test_openrouter_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_google_provider() -> Result<()> {
     test_provider(
         "Google",
