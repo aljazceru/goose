@@ -209,7 +209,7 @@ fn render_tool_response(resp: &ToolResponse, theme: Theme, debug: bool) {
                 let min_priority = config
                     .get_param::<f32>("GOOSE_CLI_MIN_PRIORITY")
                     .ok()
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.5);
 
                 if content
                     .priority()
@@ -405,8 +405,14 @@ fn print_markdown(content: &str, theme: Theme) {
         .unwrap();
 }
 
-const MAX_STRING_LENGTH: usize = 40;
 const INDENT: &str = "    ";
+
+fn get_tool_params_max_length() -> usize {
+    Config::global()
+        .get_param::<usize>("GOOSE_CLI_TOOL_PARAMS_TRUNCATION_MAX_LENGTH")
+        .ok()
+        .unwrap_or(40)
+}
 
 fn print_params(value: &Value, depth: usize, debug: bool) {
     let indent = INDENT.repeat(depth);
@@ -427,7 +433,7 @@ fn print_params(value: &Value, depth: usize, debug: bool) {
                         }
                     }
                     Value::String(s) => {
-                        if !debug && s.len() > MAX_STRING_LENGTH {
+                        if !debug && s.len() > get_tool_params_max_length() {
                             println!("{}{}: {}", indent, style(key).dim(), style("...").dim());
                         } else {
                             println!("{}{}: {}", indent, style(key).dim(), style(s).green());
@@ -452,7 +458,7 @@ fn print_params(value: &Value, depth: usize, debug: bool) {
             }
         }
         Value::String(s) => {
-            if !debug && s.len() > MAX_STRING_LENGTH {
+            if !debug && s.len() > get_tool_params_max_length() {
                 println!(
                     "{}{}",
                     indent,
@@ -527,6 +533,8 @@ fn shorten_path(path: &str, debug: bool) -> String {
 pub fn display_session_info(resume: bool, provider: &str, model: &str, session_file: &Path) {
     let start_session_msg = if resume {
         "resuming session |"
+    } else if session_file.to_str() == Some("/dev/null") || session_file.to_str() == Some("NUL") {
+        "running without session |"
     } else {
         "starting session |"
     };
@@ -538,11 +546,15 @@ pub fn display_session_info(resume: bool, provider: &str, model: &str, session_f
         style("model:").dim(),
         style(model).cyan().dim(),
     );
-    println!(
-        "    {} {}",
-        style("logging to").dim(),
-        style(session_file.display()).dim().cyan(),
-    );
+
+    if session_file.to_str() != Some("/dev/null") && session_file.to_str() != Some("NUL") {
+        println!(
+            "    {} {}",
+            style("logging to").dim(),
+            style(session_file.display()).dim().cyan(),
+        );
+    }
+
     println!(
         "    {} {}",
         style("working directory:").dim(),

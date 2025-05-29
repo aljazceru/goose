@@ -178,6 +178,23 @@ pub trait Provider: Send + Sync {
 
     /// Get the model config from the provider
     fn get_model_config(&self) -> ModelConfig;
+
+    /// Optional hook to fetch supported models asynchronously.
+    async fn fetch_supported_models_async(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+
+    /// Check if this provider supports embeddings
+    fn supports_embeddings(&self) -> bool {
+        false
+    }
+
+    /// Create embeddings if supported. Default implementation returns an error.
+    async fn create_embeddings(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, ProviderError> {
+        Err(ProviderError::ExecutionError(
+            "This provider does not support embeddings".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]

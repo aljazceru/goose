@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::error::Error;
 
+use crate::recipes::github_recipe::GOOSE_RECIPE_GITHUB_REPO_CONFIG_KEY;
+
 // useful for light themes where there is no dicernible colour contrast between
 // cursor-selected and cursor-unselected items.
 const MULTISELECT_VISIBILITY_HINT: &str = "<";
@@ -193,7 +195,7 @@ pub async fn handle_configure() -> Result<(), Box<dyn Error>> {
             .item(
                 "settings",
                 "Goose Settings",
-                "Set the Goose Mode, Tool Output, Tool Permissions, Experiment and more",
+                "Set the Goose Mode, Tool Output, Tool Permissions, Experiment, Goose recipe github repo and more",
             )
             .interact()?;
 
@@ -325,11 +327,40 @@ pub async fn configure_provider_dialog() -> Result<bool, Box<dyn Error>> {
         }
     }
 
-    // Select model, defaulting to the provider's recommended model UNLESS there is an env override
-    let default_model = std::env::var("GOOSE_MODEL").unwrap_or(provider_meta.default_model.clone());
-    let model: String = cliclack::input("Enter a model from that provider:")
-        .default_input(&default_model)
-        .interact()?;
+    // Attempt to fetch supported models for this provider
+    let spin = spinner();
+    spin.start("Attempting to fetch supported models...");
+    let models_res = {
+        let temp_model_config = goose::model::ModelConfig::new(provider_meta.default_model.clone());
+        let temp_provider = create(provider_name, temp_model_config)?;
+        temp_provider.fetch_supported_models_async().await
+    };
+    spin.stop(style("Model fetch complete").green());
+
+    // Select a model: on fetch error show styled error and abort; if Some(models), show list; if None, free-text input
+    let model: String = match models_res {
+        Err(e) => {
+            // Provider hook error
+            cliclack::outro(style(e.to_string()).on_red().white())?;
+            return Ok(false);
+        }
+        Ok(Some(models)) => cliclack::select("Select a model:")
+            .items(
+                &models
+                    .iter()
+                    .map(|m| (m, m.as_str(), ""))
+                    .collect::<Vec<_>>(),
+            )
+            .interact()?
+            .to_string(),
+        Ok(None) => {
+            let default_model =
+                std::env::var("GOOSE_MODEL").unwrap_or(provider_meta.default_model.clone());
+            cliclack::input("Enter a model from that provider:")
+                .default_input(&default_model)
+                .interact()?
+        }
+    };
 
     // Test the configuration
     let spin = spinner();
@@ -794,6 +825,11 @@ pub async fn configure_settings_dialog() -> Result<(), Box<dyn Error>> {
     let setting_type = cliclack::select("What setting would you like to configure?")
         .item("goose_mode", "Goose Mode", "Configure Goose mode")
         .item(
+            "goose_router_strategy",
+            "Router Tool Selection Strategy",
+            "Configure the strategy for selecting tools to use",
+        )
+        .item(
             "tool_permission",
             "Tool Permission",
             "Set permission for individual tool of enabled extensions",
@@ -808,11 +844,19 @@ pub async fn configure_settings_dialog() -> Result<(), Box<dyn Error>> {
             "Toggle Experiment",
             "Enable or disable an experiment feature",
         )
+        .item(
+            "recipe",
+            "Goose recipe github repo",
+            "Goose will pull recipes from this repo if not found locally.",
+        )
         .interact()?;
 
     match setting_type {
         "goose_mode" => {
             configure_goose_mode_dialog()?;
+        }
+        "goose_router_strategy" => {
+            configure_goose_router_strategy_dialog()?;
         }
         "tool_permission" => {
             configure_tool_permissions_dialog().await.and(Ok(()))?;
@@ -822,6 +866,9 @@ pub async fn configure_settings_dialog() -> Result<(), Box<dyn Error>> {
         }
         "experiment" => {
             toggle_experiments_dialog()?;
+        }
+        "recipe" => {
+            configure_recipe_dialog()?;
         }
         _ => unreachable!(),
     };
@@ -876,6 +923,49 @@ pub fn configure_goose_mode_dialog() -> Result<(), Box<dyn Error>> {
         "chat" => {
             config.set_param("GOOSE_MODE", Value::String("chat".to_string()))?;
             cliclack::outro("Set to Chat Mode - no tools or modifications enabled")?;
+        }
+        _ => unreachable!(),
+    };
+    Ok(())
+}
+
+pub fn configure_goose_router_strategy_dialog() -> Result<(), Box<dyn Error>> {
+    let config = Config::global();
+
+    // Check if GOOSE_ROUTER_STRATEGY is set as an environment variable
+    if std::env::var("GOOSE_ROUTER_TOOL_SELECTION_STRATEGY").is_ok() {
+        let _ = cliclack::log::info("Notice: GOOSE_ROUTER_TOOL_SELECTION_STRATEGY environment variable is set. Configuration will override this.");
+    }
+
+    let strategy = cliclack::select("Which router strategy would you like to use?")
+        .item(
+            "vector",
+            "Vector Strategy",
+            "Use vector-based similarity to select tools",
+        )
+        .item(
+            "default",
+            "Default Strategy",
+            "Use the default tool selection strategy",
+        )
+        .interact()?;
+
+    match strategy {
+        "vector" => {
+            config.set_param(
+                "GOOSE_ROUTER_TOOL_SELECTION_STRATEGY",
+                Value::String("vector".to_string()),
+            )?;
+            cliclack::outro(
+                "Set to Vector Strategy - using vector-based similarity for tool selection",
+            )?;
+        }
+        "default" => {
+            config.set_param(
+                "GOOSE_ROUTER_TOOL_SELECTION_STRATEGY",
+                Value::String("default".to_string()),
+            )?;
+            cliclack::outro("Set to Default Strategy - using default tool selection")?;
         }
         _ => unreachable!(),
     };
@@ -1102,5 +1192,28 @@ pub async fn configure_tool_permissions_dialog() -> Result<(), Box<dyn Error>> {
         tool.name, permission_label
     ))?;
 
+    Ok(())
+}
+
+fn configure_recipe_dialog() -> Result<(), Box<dyn Error>> {
+    let key_name = GOOSE_RECIPE_GITHUB_REPO_CONFIG_KEY;
+    let config = Config::global();
+    let default_recipe_repo = std::env::var(key_name)
+        .ok()
+        .or_else(|| config.get_param(key_name).unwrap_or(None));
+    let mut recipe_repo_input = cliclack::input(
+        "Enter your Goose Recipe Github repo (owner/repo): eg: my_org/goose-recipes",
+    )
+    .required(false);
+    if let Some(recipe_repo) = default_recipe_repo {
+        recipe_repo_input = recipe_repo_input.default_input(&recipe_repo);
+    }
+    let input_value: String = recipe_repo_input.interact()?;
+    // if input is blank, it clears the recipe github repo settings in the config file
+    if input_value.clone().trim().is_empty() {
+        config.delete(key_name)?;
+    } else {
+        config.set_param(key_name, Value::String(input_value))?;
+    }
     Ok(())
 }

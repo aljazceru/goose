@@ -7,15 +7,22 @@ use crate::commands::bench::agent_generator;
 use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
 use crate::commands::mcp::run_server;
+use crate::commands::project::{handle_project_default, handle_projects_interactive};
 use crate::commands::recipe::{handle_deeplink, handle_validate};
+// Import the new handlers from commands::schedule
+use crate::commands::schedule::{
+    handle_schedule_add, handle_schedule_list, handle_schedule_remove, handle_schedule_run_now,
+    handle_schedule_sessions,
+};
 use crate::commands::session::{handle_session_list, handle_session_remove};
 use crate::logging::setup_logging;
-use crate::recipe::load_recipe;
+use crate::recipes::recipe::{explain_recipe_with_parameters, load_recipe_as_template};
 use crate::session;
 use crate::session::{build_session, SessionBuilderConfig};
 use goose_bench::bench_config::BenchRunConfig;
 use goose_bench::runners::bench_runner::BenchRunner;
 use goose_bench::runners::eval_runner::EvalRunner;
+use goose_bench::runners::metric_aggregator::MetricAggregator;
 use goose_bench::runners::model_runner::ModelRunner;
 use std::io::Read;
 use std::path::PathBuf;
@@ -59,6 +66,13 @@ fn extract_identifier(identifier: Identifier) -> session::Identifier {
     }
 }
 
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((key, value)) => Ok((key.to_string(), value.to_string())),
+        None => Err(format!("invalid KEY=VALUE: {}", s)),
+    }
+}
+
 #[derive(Subcommand)]
 enum SessionCommand {
     #[command(about = "List all available sessions")]
@@ -81,17 +95,52 @@ enum SessionCommand {
         )]
         ascending: bool,
     },
-    #[command(about = "Remove sessions")]
+    #[command(about = "Remove sessions. Runs interactively if no ID or regex is provided.")]
     Remove {
-        #[arg(short, long, help = "session id to be removed", default_value = "")]
+        #[arg(short, long, help = "Session ID to be removed (optional)")]
+        id: Option<String>,
+        #[arg(short, long, help = "Regex for removing matched sessions (optional)")]
+        regex: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SchedulerCommand {
+    #[command(about = "Add a new scheduled job")]
+    Add {
+        #[arg(long, help = "Unique ID for the job")]
         id: String,
+        #[arg(long, help = "Cron string for the schedule (e.g., '0 0 * * * *')")]
+        cron: String,
         #[arg(
-            short,
             long,
-            help = "regex for removing matched session",
-            default_value = ""
+            help = "Recipe source (path to file, or base64 encoded recipe string)"
         )]
-        regex: String,
+        recipe_source: String,
+    },
+    #[command(about = "List all scheduled jobs")]
+    List {},
+    #[command(about = "Remove a scheduled job by ID")]
+    Remove {
+        #[arg(long, help = "ID of the job to remove")] // Changed from positional to named --id
+        id: String,
+    },
+    /// List sessions created by a specific schedule
+    #[command(about = "List sessions created by a specific schedule")]
+    Sessions {
+        /// ID of the schedule
+        #[arg(long, help = "ID of the schedule")] // Explicitly make it --id
+        id: String,
+        /// Maximum number of sessions to return
+        #[arg(long, help = "Maximum number of sessions to return")]
+        limit: Option<u32>,
+    },
+    /// Run a scheduled job immediately
+    #[command(about = "Run a scheduled job immediately")]
+    RunNow {
+        /// ID of the schedule to run
+        #[arg(long, help = "ID of the schedule to run")] // Explicitly make it --id
+        id: String,
     },
 }
 
@@ -134,24 +183,39 @@ pub enum BenchCommand {
         #[arg(short, long, help = "A serialized config file for the eval only.")]
         config: String,
     },
+
+    #[command(
+        name = "generate-leaderboard",
+        about = "Generate a leaderboard CSV from benchmark results"
+    )]
+    GenerateLeaderboard {
+        #[arg(
+            short,
+            long,
+            help = "Path to the benchmark directory containing model evaluation results"
+        )]
+        benchmark_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
 enum RecipeCommand {
     /// Validate a recipe file
-    #[command(about = "Validate a recipe file")]
+    #[command(about = "Validate a recipe")]
     Validate {
-        /// Path to the recipe file to validate
-        #[arg(help = "Path to the recipe file to validate")]
-        file: String,
+        /// Recipe name to get recipe file to validate
+        #[arg(help = "recipe name to get recipe file or full path to the recipe file to validate")]
+        recipe_name: String,
     },
 
     /// Generate a deeplink for a recipe file
-    #[command(about = "Generate a deeplink for a recipe file")]
+    #[command(about = "Generate a deeplink for a recipe")]
     Deeplink {
-        /// Path to the recipe file
-        #[arg(help = "Path to the recipe file")]
-        file: String,
+        /// Recipe name to get recipe file to generate deeplink
+        #[arg(
+            help = "recipe name to get recipe file or full path to the recipe file to generate deeplink"
+        )]
+        recipe_name: String,
     },
 }
 
@@ -194,6 +258,14 @@ enum Command {
         )]
         resume: bool,
 
+        /// Show message history when resuming
+        #[arg(
+            long,
+            help = "Show previous messages when resuming a session",
+            requires = "resume"
+        )]
+        history: bool,
+
         /// Enable debug output mode
         #[arg(
             long,
@@ -201,6 +273,15 @@ enum Command {
             long_help = "When enabled, shows complete tool responses without truncation and full paths."
         )]
         debug: bool,
+
+        /// Maximum number of consecutive identical tool calls allowed
+        #[arg(
+            long = "max-tool-repetitions",
+            value_name = "NUMBER",
+            help = "Maximum number of consecutive identical tool calls allowed",
+            long_help = "Set a limit on how many times the same tool can be called consecutively with identical parameters. Helps prevent infinite loops."
+        )]
+        max_tool_repetitions: Option<u32>,
 
         /// Add stdio extensions with environment variables and commands
         #[arg(
@@ -233,6 +314,14 @@ enum Command {
         builtins: Vec<String>,
     },
 
+    /// Open the last project directory
+    #[command(about = "Open the last project directory", visible_alias = "p")]
+    Project {},
+
+    /// List recent project directories
+    #[command(about = "List recent project directories", visible_alias = "ps")]
+    Projects,
+
     /// Execute commands from an instruction file
     #[command(about = "Execute commands from an instruction file or stdin")]
     Run {
@@ -259,17 +348,27 @@ enum Command {
         )]
         input_text: Option<String>,
 
-        /// Path to recipe.yaml file
+        /// Recipe name or full path to the recipe file
         #[arg(
             short = None,
             long = "recipe",
-            value_name = "FILE",
-            help = "Path to recipe.yaml file",
-            long_help = "Path to a recipe.yaml file that defines a custom agent configuration",
+            value_name = "RECIPE_NAME or FULL_PATH_TO_RECIPE_FILE",
+            help = "Recipe name to get recipe file or the full path of the recipe file (use --explain to see recipe details)",
+            long_help = "Recipe name to get recipe file or the full path of the recipe file that defines a custom agent configuration. Use --explain to see the recipe's title, description, and parameters.",
             conflicts_with = "instructions",
             conflicts_with = "input_text"
         )]
         recipe: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "KEY=VALUE",
+            help = "Dynamic parameters (e.g., --params username=alice --params channel_name=goose-channel)",
+            long_help = "Key-value parameters to pass to the recipe file. Can be specified multiple times.",
+            action = clap::ArgAction::Append,
+            value_parser = parse_key_val,
+        )]
+        params: Vec<(String, String)>,
 
         /// Continue in interactive mode after processing input
         #[arg(
@@ -278,6 +377,31 @@ enum Command {
             help = "Continue in interactive mode after processing initial input"
         )]
         interactive: bool,
+
+        /// Run without storing a session file
+        #[arg(
+            long = "no-session",
+            help = "Run without storing a session file",
+            long_help = "Execute commands without creating or using a session file. Useful for automated runs.",
+            conflicts_with_all = ["resume", "name", "path"] 
+        )]
+        no_session: bool,
+
+        /// Show the recipe title, description, and parameters
+        #[arg(
+            long = "explain",
+            help = "Show the recipe title, description, and parameters"
+        )]
+        explain: bool,
+
+        /// Maximum number of consecutive identical tool calls allowed
+        #[arg(
+            long = "max-tool-repetitions",
+            value_name = "NUMBER",
+            help = "Maximum number of consecutive identical tool calls allowed",
+            long_help = "Set a limit on how many times the same tool can be called consecutively with identical parameters. Helps prevent infinite loops."
+        )]
+        max_tool_repetitions: Option<u32>,
 
         /// Identifier for this run session
         #[command(flatten)]
@@ -339,6 +463,13 @@ enum Command {
         command: RecipeCommand,
     },
 
+    /// Manage scheduled jobs
+    #[command(about = "Manage scheduled jobs", visible_alias = "sched")]
+    Schedule {
+        #[command(subcommand)]
+        command: SchedulerCommand,
+    },
+
     /// Update the Goose CLI version
     #[command(about = "Update the goose CLI version")]
     Update {
@@ -378,6 +509,11 @@ struct InputConfig {
 pub async fn cli() -> Result<()> {
     let cli = Cli::parse();
 
+    // Track the current directory in projects.json
+    if let Err(e) = crate::project_tracker::update_project_tracker(None, None) {
+        eprintln!("Warning: Failed to update project tracker: {}", e);
+    }
+
     match cli.command {
         Some(Command::Configure {}) => {
             let _ = handle_configure().await;
@@ -394,7 +530,9 @@ pub async fn cli() -> Result<()> {
             command,
             identifier,
             resume,
+            history,
             debug,
+            max_tool_repetitions,
             extensions,
             remote_extensions,
             builtins,
@@ -414,25 +552,43 @@ pub async fn cli() -> Result<()> {
                 }
                 None => {
                     // Run session command by default
-                    let mut session = build_session(SessionBuilderConfig {
+                    let mut session: crate::Session = build_session(SessionBuilderConfig {
                         identifier: identifier.map(extract_identifier),
                         resume,
+                        no_session: false,
                         extensions,
                         remote_extensions,
                         builtins,
                         extensions_override: None,
                         additional_system_prompt: None,
                         debug,
+                        max_tool_repetitions,
                     })
                     .await;
                     setup_logging(
                         session.session_file().file_stem().and_then(|s| s.to_str()),
                         None,
                     )?;
+
+                    // Render previous messages if resuming a session and history flag is set
+                    if resume && history {
+                        session.render_message_history();
+                    }
+
                     let _ = session.interactive(None).await;
                     Ok(())
                 }
             };
+        }
+        Some(Command::Project {}) => {
+            // Default behavior: offer to resume the last project
+            handle_project_default()?;
+            return Ok(());
+        }
+        Some(Command::Projects) => {
+            // Interactive project selection
+            handle_projects_interactive()?;
+            return Ok(());
         }
         Some(Command::Run {
             instructions,
@@ -441,13 +597,17 @@ pub async fn cli() -> Result<()> {
             interactive,
             identifier,
             resume,
+            no_session,
             debug,
+            max_tool_repetitions,
             extensions,
             remote_extensions,
             builtins,
+            params,
+            explain,
         }) => {
-            let input_config = match (instructions, input_text, recipe) {
-                (Some(file), _, _) if file == "-" => {
+            let input_config = match (instructions, input_text, recipe, explain) {
+                (Some(file), _, _, _) if file == "-" => {
                     let mut input = String::new();
                     std::io::stdin()
                         .read_to_string(&mut input)
@@ -459,7 +619,7 @@ pub async fn cli() -> Result<()> {
                         additional_system_prompt: None,
                     }
                 }
-                (Some(file), _, _) => {
+                (Some(file), _, _, _) => {
                     let contents = std::fs::read_to_string(&file).unwrap_or_else(|err| {
                         eprintln!(
                             "Instruction file not found — did you mean to use goose run --text?\n{}",
@@ -473,23 +633,28 @@ pub async fn cli() -> Result<()> {
                         additional_system_prompt: None,
                     }
                 }
-                (_, Some(text), _) => InputConfig {
+                (_, Some(text), _, _) => InputConfig {
                     contents: Some(text),
                     extensions_override: None,
                     additional_system_prompt: None,
                 },
-                (_, _, Some(file)) => {
-                    let recipe = load_recipe(&file, true).unwrap_or_else(|err| {
-                        eprintln!("{}: {}", console::style("Error").red().bold(), err);
-                        std::process::exit(1);
-                    });
+                (_, _, Some(recipe_name), explain) => {
+                    if explain {
+                        explain_recipe_with_parameters(&recipe_name, params)?;
+                        return Ok(());
+                    }
+                    let recipe =
+                        load_recipe_as_template(&recipe_name, params).unwrap_or_else(|err| {
+                            eprintln!("{}: {}", console::style("Error").red().bold(), err);
+                            std::process::exit(1);
+                        });
                     InputConfig {
                         contents: recipe.prompt,
                         extensions_override: recipe.extensions,
-                        additional_system_prompt: Some(recipe.instructions),
+                        additional_system_prompt: recipe.instructions,
                     }
                 }
-                (None, None, None) => {
+                (None, None, None, _) => {
                     eprintln!("Error: Must provide either --instructions (-i), --text (-t), or --recipe. Use -i - for stdin.");
                     std::process::exit(1);
                 }
@@ -498,12 +663,14 @@ pub async fn cli() -> Result<()> {
             let mut session = build_session(SessionBuilderConfig {
                 identifier: identifier.map(extract_identifier),
                 resume,
+                no_session,
                 extensions,
                 remote_extensions,
                 builtins,
                 extensions_override: input_config.extensions_override,
                 additional_system_prompt: input_config.additional_system_prompt,
                 debug,
+                max_tool_repetitions,
             })
             .await;
 
@@ -523,6 +690,32 @@ pub async fn cli() -> Result<()> {
 
             return Ok(());
         }
+        Some(Command::Schedule { command }) => {
+            match command {
+                SchedulerCommand::Add {
+                    id,
+                    cron,
+                    recipe_source,
+                } => {
+                    handle_schedule_add(id, cron, recipe_source).await?;
+                }
+                SchedulerCommand::List {} => {
+                    handle_schedule_list().await?;
+                }
+                SchedulerCommand::Remove { id } => {
+                    handle_schedule_remove(id).await?;
+                }
+                SchedulerCommand::Sessions { id, limit } => {
+                    // New arm
+                    handle_schedule_sessions(id, limit).await?;
+                }
+                SchedulerCommand::RunNow { id } => {
+                    // New arm
+                    handle_schedule_run_now(id).await?;
+                }
+            }
+            return Ok(());
+        }
         Some(Command::Update {
             canary,
             reconfigure,
@@ -533,22 +726,31 @@ pub async fn cli() -> Result<()> {
         Some(Command::Bench { cmd }) => {
             match cmd {
                 BenchCommand::Selectors { config } => BenchRunner::list_selectors(config)?,
-                BenchCommand::InitConfig { name } => BenchRunConfig::default().save(name),
+                BenchCommand::InitConfig { name } => {
+                    let mut config = BenchRunConfig::default();
+                    let cwd =
+                        std::env::current_dir().expect("Failed to get current working directory");
+                    config.output_dir = Some(cwd);
+                    config.save(name);
+                }
                 BenchCommand::Run { config } => BenchRunner::new(config)?.run()?,
                 BenchCommand::EvalModel { config } => ModelRunner::from(config)?.run()?,
                 BenchCommand::ExecEval { config } => {
                     EvalRunner::from(config)?.run(agent_generator).await?
+                }
+                BenchCommand::GenerateLeaderboard { benchmark_dir } => {
+                    MetricAggregator::generate_csv_from_benchmark_dir(&benchmark_dir)?
                 }
             }
             return Ok(());
         }
         Some(Command::Recipe { command }) => {
             match command {
-                RecipeCommand::Validate { file } => {
-                    handle_validate(file)?;
+                RecipeCommand::Validate { recipe_name } => {
+                    handle_validate(&recipe_name)?;
                 }
-                RecipeCommand::Deeplink { file } => {
-                    handle_deeplink(file)?;
+                RecipeCommand::Deeplink { recipe_name } => {
+                    handle_deeplink(&recipe_name)?;
                 }
             }
             return Ok(());
@@ -559,7 +761,19 @@ pub async fn cli() -> Result<()> {
                 Ok(())
             } else {
                 // Run session command by default
-                let mut session = build_session(SessionBuilderConfig::default()).await;
+                let mut session = build_session(SessionBuilderConfig {
+                    identifier: None,
+                    resume: false,
+                    no_session: false,
+                    extensions: Vec::new(),
+                    remote_extensions: Vec::new(),
+                    builtins: Vec::new(),
+                    extensions_override: None,
+                    additional_system_prompt: None,
+                    debug: false,
+                    max_tool_repetitions: None,
+                })
+                .await;
                 setup_logging(
                     session.session_file().file_stem().and_then(|s| s.to_str()),
                     None,

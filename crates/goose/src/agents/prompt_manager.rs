@@ -3,12 +3,15 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::agents::extension::ExtensionInfo;
+use crate::agents::router_tool_selector::RouterToolSelectionStrategy;
+use crate::agents::router_tools::vector_search_tool_prompt;
 use crate::providers::base::get_current_model;
 use crate::{config::Config, prompt_template};
 
 pub struct PromptManager {
     system_prompt_override: Option<String>,
     system_prompt_extras: Vec<String>,
+    current_date_timestamp: String,
 }
 
 impl Default for PromptManager {
@@ -22,6 +25,8 @@ impl PromptManager {
         PromptManager {
             system_prompt_override: None,
             system_prompt_extras: Vec::new(),
+            // Use the fixed current date time so that prompt cache can be used.
+            current_date_timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         }
     }
 
@@ -64,6 +69,7 @@ impl PromptManager {
         frontend_instructions: Option<String>,
         suggest_disable_extensions_prompt: Value,
         model_name: Option<&str>,
+        tool_selection_strategy: Option<RouterToolSelectionStrategy>,
     ) -> String {
         let mut context: HashMap<&str, Value> = HashMap::new();
         let mut extensions_info = extensions_info.clone();
@@ -79,8 +85,20 @@ impl PromptManager {
 
         context.insert("extensions", serde_json::to_value(extensions_info).unwrap());
 
-        let current_date_time = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        context.insert("current_date_time", Value::String(current_date_time));
+        match tool_selection_strategy {
+            Some(RouterToolSelectionStrategy::Vector) => {
+                context.insert(
+                    "tool_selection_strategy",
+                    Value::String(vector_search_tool_prompt()),
+                );
+            }
+            None => {}
+        }
+
+        context.insert(
+            "current_date_time",
+            Value::String(self.current_date_timestamp.clone()),
+        );
 
         // Add the suggestion about disabling extensions if flag is true
         context.insert(

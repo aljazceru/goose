@@ -1,9 +1,8 @@
 import { Popover, PopoverContent, PopoverPortal, PopoverTrigger } from '../ui/popover';
 import React, { useEffect, useState } from 'react';
-import { ChatSmart, Idea, More, Refresh, Time, Send } from '../icons';
+import { ChatSmart, Idea, Refresh, Time, Send, Settings } from '../icons';
 import { FolderOpen, Moon, Sliders, Sun } from 'lucide-react';
 import { useConfig } from '../ConfigContext';
-import { settingsV2Enabled } from '../../flags';
 import { ViewOptions, View } from '../../App';
 
 interface MenuButtonProps {
@@ -13,6 +12,7 @@ interface MenuButtonProps {
   className?: string;
   danger?: boolean;
   icon?: React.ReactNode;
+  testId?: string;
 }
 
 const MenuButton: React.FC<MenuButtonProps> = ({
@@ -22,9 +22,11 @@ const MenuButton: React.FC<MenuButtonProps> = ({
   className = '',
   danger = false,
   icon,
+  testId = '',
 }) => (
   <button
     onClick={onClick}
+    data-testid={testId}
     className={`w-full text-left px-4 py-3 min-h-[64px] text-sm hover:bg-bgSubtle transition-[background] border-b border-borderSubtle ${
       danger ? 'text-red-400' : ''
     } ${className}`}
@@ -123,17 +125,14 @@ export default function MoreMenu({
   useEffect(() => {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
-    // Handler for system theme changes
     const handleThemeChange = (e: { matches: boolean }) => {
       if (themeMode === 'system') {
         setDarkMode(e.matches);
       }
     };
 
-    // Add listener for system theme changes
     mediaQuery.addEventListener('change', handleThemeChange);
 
-    // Initial setup
     if (themeMode === 'system') {
       setDarkMode(mediaQuery.matches);
       localStorage.setItem('use_system_theme', 'true');
@@ -143,7 +142,6 @@ export default function MoreMenu({
       localStorage.setItem('theme', themeMode);
     }
 
-    // Cleanup
     return () => mediaQuery.removeEventListener('change', handleThemeChange);
   }, [themeMode]);
 
@@ -160,16 +158,16 @@ export default function MoreMenu({
   const handleThemeChange = (newTheme: 'light' | 'dark' | 'system') => {
     setThemeMode(newTheme);
   };
-
+  const recipeConfig = window.appConfig.get('recipeConfig');
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button
           data-testid="more-options-button"
-          className={`z-[100] absolute top-2 right-4 w-[20px] h-[20px] transition-colors cursor-pointer no-drag hover:text-textProminent ${open ? 'text-textProminent' : 'text-textSubtle'}`}
+          className={`z-[100] w-7 h-7 p-1 rounded-full border border-borderSubtle transition-colors cursor-pointer no-drag hover:text-textStandard hover:border-borderStandard ${open ? 'text-textStandard' : 'text-textSubtle'}`}
           role="button"
         >
-          <More />
+          <Settings />
         </button>
       </PopoverTrigger>
 
@@ -219,6 +217,16 @@ export default function MoreMenu({
                 Session history
               </MenuButton>
 
+              {process.env.ALPHA && (
+                <MenuButton
+                  onClick={() => setView('schedules')}
+                  subtitle="Manage scheduled runs"
+                  icon={<Time className="w-4 h-4" />}
+                >
+                  Scheduler
+                </MenuButton>
+              )}
+
               <MenuButton
                 onClick={() => setIsGoosehintsModalOpen(true)}
                 subtitle="Customize instructions"
@@ -227,31 +235,38 @@ export default function MoreMenu({
                 Configure .goosehints
               </MenuButton>
 
-              {/* Make Agent from Chat - disabled if already in a recipe */}
-              <MenuButton
-                onClick={() => {
-                  const recipeConfig = window.appConfig.get('recipeConfig');
-                  if (!recipeConfig) {
+              {recipeConfig ? (
+                <MenuButton
+                  onClick={() => {
+                    setOpen(false);
+                    window.electron.createChatWindow(
+                      undefined, // query
+                      undefined, // dir
+                      undefined, // version
+                      undefined, // resumeSessionId
+                      recipeConfig, // recipe config
+                      'recipeEditor' // view type
+                    );
+                  }}
+                  subtitle="View the recipe you're using"
+                  icon={<Send className="w-4 h-4" />}
+                >
+                  View recipe
+                </MenuButton>
+              ) : (
+                <MenuButton
+                  onClick={() => {
                     setOpen(false);
                     // Signal to ChatView that we want to make an agent from the current chat
                     window.electron.logInfo('Make Agent button clicked');
                     window.dispatchEvent(new CustomEvent('make-agent-from-chat'));
-                  }
-                }}
-                subtitle="Make a custom agent you can share or reuse with a link"
-                icon={<Send className="w-4 h-4" />}
-                className={
-                  window.appConfig.get('recipeConfig') ? 'opacity-50 cursor-not-allowed' : ''
-                }
-              >
-                Make Agent from this session
-                {window.appConfig.get('recipeConfig') && (
-                  <div className="text-xs text-textSubtle mt-1">
-                    (Not available while using a recipe/botling)
-                  </div>
-                )}
-              </MenuButton>
-
+                  }}
+                  subtitle="Make a custom agent you can share or reuse with a link"
+                  icon={<Send className="w-4 h-4" />}
+                >
+                  Make Agent from this session
+                </MenuButton>
+              )}
               <MenuButton
                 onClick={() => {
                   setOpen(false);
@@ -259,6 +274,7 @@ export default function MoreMenu({
                 }}
                 subtitle="View all settings and options"
                 icon={<Sliders className="w-4 h-4 rotate-90" />}
+                testId="advanced-settings-button"
               >
                 Advanced settings
                 <span className="text-textSubtle ml-1">⌘,</span>
@@ -266,40 +282,21 @@ export default function MoreMenu({
 
               <ThemeSelect themeMode={themeMode} onThemeChange={handleThemeChange} />
 
-              {settingsV2Enabled && (
-                <MenuButton
-                  data-testid="reset-provider-button"
-                  onClick={async () => {
-                    await remove('GOOSE_PROVIDER', false);
-                    await remove('GOOSE_MODEL', false);
-                    setOpen(false);
-                    setView('welcome');
-                  }}
-                  danger
-                  subtitle="Clear selected model and restart (alpha)"
-                  icon={<Refresh className="w-4 h-4 text-textStandard" />}
-                  className="border-b-0"
-                >
-                  Reset provider and model
-                </MenuButton>
-              )}
-
-              {!settingsV2Enabled && (
-                <MenuButton
-                  data-testid="reset-provider-button"
-                  onClick={() => {
-                    localStorage.removeItem('GOOSE_PROVIDER');
-                    setOpen(false);
-                    window.electron.createChatWindow();
-                  }}
-                  danger
-                  subtitle="Clear selected model and restart"
-                  icon={<Refresh className="w-4 h-4 text-textStandard" />}
-                  className="border-b-0"
-                >
-                  Reset provider and model
-                </MenuButton>
-              )}
+              <MenuButton
+                data-testid="reset-provider-button"
+                onClick={async () => {
+                  await remove('GOOSE_PROVIDER', false);
+                  await remove('GOOSE_MODEL', false);
+                  setOpen(false);
+                  setView('welcome');
+                }}
+                danger
+                subtitle="Clear selected model and restart (alpha)"
+                icon={<Refresh className="w-4 h-4 text-textStandard" />}
+                className="border-b-0"
+              >
+                Reset provider and model
+              </MenuButton>
             </div>
           </PopoverContent>
         </>

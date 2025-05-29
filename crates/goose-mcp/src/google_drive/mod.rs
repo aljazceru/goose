@@ -1,8 +1,10 @@
+mod google_labels;
 mod oauth_pkce;
 pub mod storage;
 
 use anyhow::{Context, Error};
 use base64::Engine;
+use chrono::NaiveDate;
 use indoc::indoc;
 use lazy_static::lazy_static;
 use mcp_core::tool::ToolAnnotations;
@@ -28,11 +30,15 @@ use google_docs1::{self, Docs};
 use google_drive3::common::ReadSeek;
 use google_drive3::{
     self,
-    api::{Comment, File, FileShortcutDetails, Permission, Reply, Scope},
+    api::{
+        Comment, File, FileShortcutDetails, LabelFieldModification, LabelModification,
+        ModifyLabelsRequest, Permission, Reply, Scope,
+    },
     hyper_rustls::{self, HttpsConnector},
     hyper_util::{self, client::legacy::connect::HttpConnector},
     DriveHub,
 };
+use google_labels::DriveLabelsHub;
 use google_sheets4::{self, Sheets};
 use http_body_util::BodyExt;
 
@@ -80,6 +86,7 @@ pub struct GoogleDriveRouter {
     tools: Vec<Tool>,
     instructions: String,
     drive: DriveHub<HttpsConnector<HttpConnector>>,
+    drive_labels: DriveLabelsHub<HttpsConnector<HttpConnector>>,
     sheets: Sheets<HttpsConnector<HttpConnector>>,
     docs: Docs<HttpsConnector<HttpConnector>>,
     credentials_manager: Arc<CredentialsManager>,
@@ -88,6 +95,7 @@ pub struct GoogleDriveRouter {
 impl GoogleDriveRouter {
     async fn google_auth() -> (
         DriveHub<HttpsConnector<HttpConnector>>,
+        DriveLabelsHub<HttpsConnector<HttpConnector>>,
         Sheets<HttpsConnector<HttpConnector>>,
         Docs<HttpsConnector<HttpConnector>>,
         Arc<CredentialsManager>,
@@ -162,7 +170,7 @@ impl GoogleDriveRouter {
         // Read the OAuth credentials from the keyfile
         match fs::read_to_string(keyfile_path) {
             Ok(_) => {
-                // Create the PKCE OAuth2 clien
+                // Create the PKCE OAuth2 client
                 let auth = PkceOAuth2Client::new(keyfile_path, credentials_manager.clone())
                     .expect("Failed to create OAuth2 client");
 
@@ -180,11 +188,18 @@ impl GoogleDriveRouter {
                 );
 
                 let drive_hub = DriveHub::new(client.clone(), auth.clone());
+                let drive_labels_hub = DriveLabelsHub::new(client.clone(), auth.clone());
                 let sheets_hub = Sheets::new(client.clone(), auth.clone());
                 let docs_hub = Docs::new(client, auth);
 
                 // Create and return the DriveHub, Sheets and our PKCE OAuth2 client
-                (drive_hub, sheets_hub, docs_hub, credentials_manager)
+                (
+                    drive_hub,
+                    drive_labels_hub,
+                    sheets_hub,
+                    docs_hub,
+                    credentials_manager,
+                )
             }
             Err(e) => {
                 tracing::error!(
@@ -199,24 +214,28 @@ impl GoogleDriveRouter {
 
     pub async fn new() -> Self {
         // handle auth
-        let (drive, sheets, docs, credentials_manager) = Self::google_auth().await;
+        let (drive, drive_labels, sheets, docs, credentials_manager) = Self::google_auth().await;
 
         let search_tool = Tool::new(
             "search".to_string(),
             indoc! {r#"
-                Search for files in google drive by name, given an input search query. At least one of ('name', 'mimeType', or 'parent') are required.
+                List or search for files or labels in google drive by name, given an input search query. At least one of ('name', 'mimeType', or 'parent') are required for file searches.
             "#}
             .to_string(),
             json!({
               "type": "object",
               "properties": {
+                "driveType": {
+                    "type": "string",
+                    "description": "Required type of object to list or search (file, label)."
+                },
                 "name": {
                     "type": "string",
                     "description": "String to search for in the file's name.",
                 },
                 "mimeType": {
                     "type": "string",
-                    "description": "MIME type to constrain the search to.",
+                    "description": "Use when searching for a file to constrain the results to just this MIME type.",
                 },
                 "parent": {
                     "type": "string",
@@ -233,8 +252,13 @@ impl GoogleDriveRouter {
                 "pageSize": {
                     "type": "number",
                     "description": "How many items to return from the search query, default 10, max 100",
+                },
+                "includeLabels": {
+                    "type": "boolean",
+                    "description": "When searching or listing files, also get any applied labels.",
                 }
               },
+              "required": ["driveType"],
             }),
             Some(ToolAnnotations {
                     title: Some("Search GDrive".to_string()),
@@ -285,55 +309,10 @@ impl GoogleDriveRouter {
             }),
         );
 
-        let upload_tool = Tool::new(
-            "upload".to_string(),
-            indoc! {r#"
-                Upload a file to Google Drive.
-            "#}
-            .to_string(),
-            json!({
-              "type": "object",
-              "properties": {
-                  "name": {
-                      "type": "string",
-                      "description": "The desired filename to use for the uploaded file.",
-                  },
-                  "mimeType": {
-                      "type": "string",
-                      "description": "The MIME type of the file.",
-                  },
-                  "body": {
-                      "type": "string",
-                      "description": "Plain text body of the file to upload. Mutually exclusive with path.",
-                  },
-                  "path": {
-                      "type": "string",
-                      "description": "Path to the file to upload. Mutually exclusive with body.",
-                  },
-                  "parentId": {
-                      "type": "string",
-                      "description": "ID of the parent folder in which to create the file. (default: creates files in the root of 'My Drive')",
-                  },
-                  "allowSharedDrives": {
-                      "type": "boolean",
-                      "description": "Whether to allow access to shared drives or just your personal drive (default: false)",
-                  }
-              },
-              "required": ["name", "mimeType"],
-            }),
-            Some(ToolAnnotations {
-                title: Some("Upload file to GDrive".to_string()),
-                read_only_hint: false,
-                destructive_hint: false,
-                idempotent_hint: false,
-                open_world_hint: false,
-            }),
-        );
-
         let create_file_tool = Tool::new(
             "create_file".to_string(),
             indoc! {r#"
-                Create a Google file (Document, Spreadsheet, Slides, folder, or shortcut) in Google Drive.
+                Create a new file, including Document, Spreadsheet, Slides, folder, or shortcut, in Google Drive.
             "#}
             .to_string(),
             json!({
@@ -343,10 +322,9 @@ impl GoogleDriveRouter {
                       "type": "string",
                       "description": "Name of the file to create",
                   },
-                  "fileType": {
+                  "mimeType": {
                       "type": "string",
-                      "enum": ["document", "spreadsheet", "slides", "folder", "shortcut"],
-                      "description": "Type of Google file to create (document, spreadsheet, slides, folder, or shortcut)",
+                      "description": "The MIME type of the file.",
                   },
                   "body": {
                       "type": "string",
@@ -369,7 +347,7 @@ impl GoogleDriveRouter {
                       "description": "Whether to allow access to shared drives or just your personal drive (default: false)",
                   }
               },
-              "required": ["name", "fileType"],
+              "required": ["name", "mimeType"],
             }),
             Some(ToolAnnotations {
                 title: Some("Create new file in GDrive".to_string()),
@@ -416,7 +394,7 @@ impl GoogleDriveRouter {
         let update_file_tool = Tool::new(
             "update_file".to_string(),
             indoc! {r#"
-                Update a normal non-Google file (not Document, Spreadsheet, and Slides) in Google Drive with new content.
+                Update an existing file in Google Drive with new content or edit the file's labels.
             "#}
             .to_string(),
             json!({
@@ -426,69 +404,93 @@ impl GoogleDriveRouter {
                       "type": "string",
                       "description": "The ID of the file to update.",
                   },
+                  "allowSharedDrives": {
+                      "type": "boolean",
+                      "description": "Whether to allow access to shared drives or just your personal drive (default: false)",
+                  },
                   "mimeType": {
                       "type": "string",
                       "description": "The MIME type of the file.",
                   },
                   "body": {
                       "type": "string",
-                      "description": "Plain text body of the file to upload. Mutually exclusive with path.",
+                      "description": "Plain text body of the file to upload. Mutually exclusive with path (required for Google Document and Google Spreadsheet types).",
                   },
                   "path": {
                       "type": "string",
-                      "description": "Path to a local file to use to update the Google Drive file. Mutually exclusive with body.",
+                      "description": "Path to a local file to use to update the Google Drive file. Mutually exclusive with body (required for Google Slides type)",
                   },
-                  "allowSharedDrives": {
-                      "type": "boolean",
-                      "description": "Whether to allow access to shared drives or just your personal drive (default: false)",
-                  }
+                  "updateLabels": {
+                      "type": "array",
+                      "description": "Array of label operations to perform on the file. Each operation may remove one label, unset one field, or update one field.",
+                      "items": {
+                          "type": "object",
+                          "properties": {
+                              "labelId": {
+                                  "type": "string",
+                                  "description": "The ID of the label to be operated upon."
+                              },
+                              "operation": {
+                                  "type": "string",
+                                  "enum":  ["removeLabel", "unsetField", "addOrUpdateLabel"],
+                                  "description": "The operation to perform. You may 'removeLabel' to completely remove the label from the file, 'unsetField' to remove a field from an applied label, or 'addOrUpdateLabel' to add a new label (with or without fields), or change the value of a field on an applied label."
+                              },
+                              "fieldId": {
+                                  "type": "string",
+                                  "description": "The ID of the field to be operated upon."
+                              },
+                              "dateValue": {
+                                  "type": "array",
+                                  "description": "If updating a date field, an array of RFC 3339 dates (format YYYY-MM-DD) to update to.",
+                                  "items": {
+                                      "type": "string",
+                                      "description": "An RFC 3339 full-date format YYYY-MM-DD.",
+                                  }
+                              },
+                              "textValue": {
+                                  "type": "array",
+                                  "description": "If updating a text field, the string values to update to.",
+                                  "items": {
+                                      "type": "string",
+                                      "description": "Text field values.",
+                                  }
+                              },
+                              "choiceValue": {
+                                  "type": "array",
+                                  "description": "If updating a Choice field, the ID(s) of the desired choice field(s).",
+                                  "items": {
+                                      "type": "string",
+                                      "description": "Choice ID as a string",
+                                  }
+                              },
+                              "integerValue": {
+                                  "type": "array",
+                                  "description": "If updating an integer field, the integer values to use.",
+                                  "items": {
+                                      "type": "integer",
+                                      "description": "The integer value.",
+                                  }
+                              },
+                              "userValue": {
+                                  "type": "array",
+                                  "description": "If updating a user field, an array of the email address(es) of the user(s) to set as the field value.",
+                                  "items": {
+                                      "type": "string",
+                                      "description": "Email address as a string",
+                                  }
+                              }
+                          }
+                      }
+                  },
               },
-              "required": ["fileId", "mimeType"],
+              "required": ["fileId"],
+              "dependentRequired": {
+                  "body": ["mimeType"],
+                  "path": ["mimeType"]
+              }
             }),
             Some(ToolAnnotations {
-                title: Some("Update a non-Google file".to_string()),
-                read_only_hint: false,
-                destructive_hint: true,
-                idempotent_hint: false,
-                open_world_hint: false,
-            }),
-        );
-
-        let update_google_file_tool = Tool::new(
-            "update_google_file".to_string(),
-            indoc! {r#"
-                Update a Google file (Document, Spreadsheet, or Slides) in Google Drive.
-            "#}
-            .to_string(),
-            json!({
-              "type": "object",
-              "properties": {
-                  "fileId": {
-                      "type": "string",
-                      "description": "ID of the file to update",
-                  },
-                  "fileType": {
-                      "type": "string",
-                      "enum": ["document", "spreadsheet", "slides"],
-                      "description": "Type of Google file to update (document, spreadsheet, or slides)",
-                  },
-                  "body": {
-                      "type": "string",
-                      "description": "Text content for the file (required for document and spreadsheet types)",
-                  },
-                  "path": {
-                      "type": "string",
-                      "description": "Path to a file to upload (required for slides type)",
-                  },
-                  "allowSharedDrives": {
-                      "type": "boolean",
-                      "description": "Whether to allow access to shared drives or just your personal drive (default: false)",
-                  }
-              },
-              "required": ["fileId", "fileType"],
-            }),
-            Some(ToolAnnotations {
-                title: Some("Update a Google file".to_string()),
+                title: Some("Update a file's contents or labels".to_string()),
                 read_only_hint: false,
                 destructive_hint: true,
                 idempotent_hint: false,
@@ -554,7 +556,13 @@ impl GoogleDriveRouter {
               },
               "required": ["spreadsheetId", "operation"],
             }),
-            None,
+            Some(ToolAnnotations {
+                title: Some("Work with Google Sheets data using various operations.".to_string()),
+                read_only_hint: false,
+                destructive_hint: true,
+                idempotent_hint: false,
+                open_world_hint: false,
+            }),
         );
 
         let docs_tool = Tool::new(
@@ -605,7 +613,13 @@ impl GoogleDriveRouter {
               },
               "required": ["documentId", "operation"],
             }),
-            None,
+            Some(ToolAnnotations {
+                title: Some("Work with Google Docs data using various operations.".to_string()),
+                read_only_hint: false,
+                destructive_hint: true,
+                idempotent_hint: false,
+                open_world_hint: false,
+            }),
         );
 
         let get_comments_tool = Tool::new(
@@ -633,39 +647,14 @@ impl GoogleDriveRouter {
             }),
         );
 
-        let create_comment_tool = Tool::new(
-            "create_comment".to_string(),
+        let manage_comment_tool = Tool::new(
+            "manage_comment".to_string(),
             indoc! {r#"
-                Create a comment for the latest revision of a Google Drive file. The Google Drive API only supports unanchored comments (they don't refer to a specific location in the file).
-            "#}
-            .to_string(),
-            json!({
-              "type": "object",
-              "properties": {
-                "fileId": {
-                    "type": "string",
-                    "description": "Id of the file to comment on.",
-                },
-                "comment": {
-                    "type": "string",
-                    "description": "Content of the comment.",
-                }
-              },
-              "required": ["fileId", "comment"],
-            }),
-            Some(ToolAnnotations {
-                title: Some("Create file comment".to_string()),
-                read_only_hint: false,
-                destructive_hint: false,
-                idempotent_hint: false,
-                open_world_hint: false,
-            }),
-        );
+                Manage comment for a Google Drive file.
 
-        let reply_tool = Tool::new(
-            "reply".to_string(),
-            indoc! {r#"
-                Add a reply to a comment thread, or resolve a comment.
+                Supports the operations:
+                - create: Create a comment for the latest revision of a Google Drive file. The Google Drive API only supports unanchored comments (they don't refer to a specific location in the file).
+                - reply: Add a reply to a comment thread, or resolve a comment.
             "#}
             .to_string(),
             json!({
@@ -675,23 +664,28 @@ impl GoogleDriveRouter {
                     "type": "string",
                     "description": "Id of the file.",
                 },
-                "commentId": {
+                "operation": {
                     "type": "string",
-                    "description": "Id of the comment to which you'd like to reply.",
+                    "description": "Desired comment management operation.",
+                    "enum": ["create", "reply"],
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content of the reply.",
+                    "description": "Content of the comment to create or reply.",
+                },
+                "commentId": {
+                    "type": "string",
+                    "description": "Id of the comment to which you'd like to reply. ",
                 },
                 "resolveComment": {
                     "type": "boolean",
-                    "description": "Whether to resolve the comment. Defaults to false.",
+                    "description": "Whether to resolve the comment in reply. Defaults to false.",
                 }
               },
-              "required": ["fileId", "commentId", "content"],
+              "required": ["fileId", "operation", "content"],
             }),
             Some(ToolAnnotations {
-                title: Some("Reply to a comment".to_string()),
+                title: Some("Manage file comment".to_string()),
                 read_only_hint: false,
                 destructive_hint: false,
                 idempotent_hint: false,
@@ -810,28 +804,27 @@ impl GoogleDriveRouter {
 
             ## Overview
             The Google Drive MCP server provides tools for interacting with Google Drive files, Google Sheets, and Google Docs:
-            1. search - Find files in your Google Drive
+            1. search - List or search for files or labels in your Google Drive
             2. read - Read file contents directly using a uri in the `gdrive:///uri` format
             3. move_file - Move a file to a new location in Google Drive
             4. list_drives - List the shared drives to which you have access
             5. get_permissions - List the permissions of a file or folder
             6. sharing - Share a file or folder with others
             7. get_comments - List a file or folder's comments
-            8. create_comment - Create a comment on a file or folder
-            9. reply - Reply to a comment on a file or folder
-            10. create_file - Create Google Workspace files (Docs, Sheets, or Slides)
-            11. update_google_file - Update existing Google Workspace files (Docs, Sheets, or Slides)
-            12. upload - Upload any kind of file to Google Drive
-            13. update_file - Update existing normal non-Google Workspace files
-            14. sheets_tool - Work with Google Sheets data using various operations
-            15. docs_tool - Work with Google Docs data using various operations
+            8. manage_comment - Manage comment for a Google Drive file.
+            9. create_file - Create a new file
+            10. update_file - Update an existing file's contents or labels
+            11. sheets_tool - Work with Google Sheets data using various operations
+            12. docs_tool - Work with Google Docs data using various operations
 
             ## Available Tools
 
             ### 1. Search Tool
-            Search for files in Google Drive, by name and ordered by most recently viewedByMeTime.
+            Search for or list files or labels in Google Drive. Files are
+            searched by name and ordered by most recently viewedByMeTime.
             A corpora parameter controls which corpus is searched.
-            Returns: List of files with their names, MIME types, and IDs
+            Returns: List of files with their names, MIME types, and IDs or a
+            list of labels and their fields.
 
             ### 2. Read File Tool
             Read a file's contents using its ID, and optionally include images as base64 encoded data.
@@ -884,37 +877,34 @@ impl GoogleDriveRouter {
             ### 7. Get Comments Tool
             Lists the comments for a Google Workspace file.
 
-            ### 8. Create Comment Tool
-            Create a new comment on a Google Workspace file. The Google Drive
-            API only allows "unanchored" comments, which are comments not
-            attache to a specific location or region in the document.
+            ### 8. Manage Comment Tool
+            Create or reply comment for a Google Drive file.
 
-            ### 9. Reply Tool
-            Reply to an existing comment.
-
-            ### 10. Create File Tool
-            Create Google Workspace files (Docs, Sheets, or Slides) directly in Google Drive.
+            ### 9. Create File Tool
+            Create any kind of file, including Google Workspace files (Docs, Sheets, or Slides) directly in Google Drive.
             - For Google Docs: Converts Markdown text to a Google Document
             - For Google Sheets: Converts CSV text to a Google Spreadsheet
             - For Google Slides: Converts a PowerPoint file to Google Slides (requires a path to the powerpoint file)
-
-            ### 11. Update Google File Tool
-            Update existing Google Workspace files (Docs, Sheets, or Slides) in Google Drive.
-            - For Google Docs: Updates with new Markdown text
-            - For Google Sheets: Updates with new CSV text
-            - For Google Slides: Updates with a new PowerPoint file (requires a path to the powerpoint file)
+            - Other: No file conversion.
 
             *Note*: All updates overwrite the existing content with the new
             content provided. To modify specific parts of the document, you must
             include the changes as part of the entire document.
 
-            ### 12. Upload Tool
-            Upload any kind of file to Google Drive. The file will not be converted to a Google Workspace file.
+            ### 10. Update File Tool
+            Replace the entire contents of an existing file with new content,
+            including Google Workspace files (Docs, Sheets, or Slides), or
+            update the labels applied to a file.
+            - For Google Docs: Updates with new Markdown text
+            - For Google Sheets: Updates with new CSV text
+            - For Google Slides: Updates with a new PowerPoint file (requires a path to the powerpoint file)
+            - Other: No file conversion.
 
-            ### 13. Update File Tool
-            Replace the entire contents of an existing Google Drive file with new content. This is for non-Google Workspace files only.
+            Label operations include adding a new label, unsetting a field for
+            an already-applied label, removing a label, or changing the field
+            value for an applied label.
 
-            ### 14. Sheets Tool
+            ### 11. Sheets Tool
             Work with Google Sheets data using various operations:
             - list_sheets: List all sheets in a spreadsheet
             - get_columns: Get column headers from a specific sheet
@@ -941,7 +931,7 @@ impl GoogleDriveRouter {
             - title: Title for the new sheet (required for add_sheet operation)
             - valueInputOption: How input data should be interpreted (RAW or USER_ENTERED)
 
-            ### 15. Docs Tool
+            ### 12. Docs Tool
             Work with Google Docs data using various operations:
             - get_document: Get the full document content
             - insert_text: Insert text at a specific location
@@ -986,22 +976,20 @@ impl GoogleDriveRouter {
             tools: vec![
                 search_tool,
                 read_tool,
-                upload_tool,
                 create_file_tool,
                 move_file_tool,
                 update_file_tool,
-                update_google_file_tool,
                 sheets_tool,
                 docs_tool,
                 get_comments_tool,
-                create_comment_tool,
-                reply_tool,
+                manage_comment_tool,
                 list_drives_tool,
                 get_permissions_tool,
                 sharing_tool,
             ],
             instructions,
             drive,
+            drive_labels,
             sheets,
             docs,
             credentials_manager,
@@ -1010,6 +998,22 @@ impl GoogleDriveRouter {
 
     // Implement search tool functionality
     async fn search(&self, params: Value) -> Result<Vec<Content>, ToolError> {
+        // To minimize tool growth, we search/list for a number of different
+        // objects in Gdrive with sub-funcs.
+        let drive_type = params.get("driveType").and_then(|q| q.as_str()).ok_or(
+            ToolError::InvalidParameters("The type is required".to_string()),
+        )?;
+        match drive_type {
+            "file" => return self.search_files(params).await,
+            "label" => return self.list_labels(params).await,
+            t => Err(ToolError::InvalidParameters(format!(
+                "type must be one of ('file', 'label'), got {}",
+                t
+            ))),
+        }
+    }
+
+    async fn search_files(&self, params: Value) -> Result<Vec<Content>, ToolError> {
         let name = params.get("name").and_then(|q| q.as_str());
         let mime_type = params.get("mimeType").and_then(|q| q.as_str());
         let drive_id = params.get("driveId").and_then(|q| q.as_str());
@@ -1051,6 +1055,11 @@ impl GoogleDriveRouter {
             })
             .unwrap_or(Ok(10))?;
 
+        let include_labels = params
+            .get("includeLabels")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+
         let mut query = Vec::new();
         if let Some(n) = name {
             query.push(
@@ -1081,7 +1090,13 @@ impl GoogleDriveRouter {
             .corpora(corpus)
             .q(query_string.as_str())
             .order_by("viewedByMeTime desc")
-            .param("fields", "files(id, name, mimeType, modifiedTime, size)")
+            .param(
+                "fields",
+                &format!(
+                    "files(id, name, mimeType, modifiedTime, size{})",
+                    if include_labels { ", labelInfo" } else { "" }
+                ),
+            )
             .page_size(page_size)
             .supports_all_drives(true)
             .include_items_from_all_drives(true)
@@ -1091,8 +1106,34 @@ impl GoogleDriveRouter {
         if let (Some(d), "drive") = (drive_id, corpus) {
             builder = builder.drive_id(d);
         }
-        let result = builder.doit().await;
+        // If we want labels, we have to go look up the IDs first.
+        // let mut label_results: Vec<Label> = Vec::new();
+        if include_labels {
+            let label_builder = self
+                .drive_labels
+                .labels()
+                .list()
+                .param("view", "LABEL_VIEW_BASIC");
+            // .param("view", "LABEL_VIEW_FULL");
 
+            let label_results = match label_builder.doit().await {
+                Ok(r) => r.1.labels.unwrap_or_default(),
+                Err(e) => {
+                    return Err(ToolError::ExecutionError(format!(
+                        "Failed to execute google drive label list '{}'.",
+                        e
+                    )))
+                }
+            };
+            let label_ids = label_results
+                .iter()
+                .filter_map(|l| l.id.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            builder = builder.include_labels(&label_ids);
+        }
+
+        let result = builder.doit().await;
         match result {
             Err(e) => Err(ToolError::ExecutionError(format!(
                 "Failed to execute google drive search query '{}', {}.",
@@ -1105,10 +1146,15 @@ impl GoogleDriveRouter {
                         .map(|files| {
                             files.into_iter().map(|f| {
                                 format!(
-                                    "{} ({}) (uri: {})",
+                                    "{} ({}) (uri: {}){}",
                                     f.name.unwrap_or_default(),
                                     f.mime_type.unwrap_or_default(),
-                                    f.id.unwrap_or_default()
+                                    f.id.unwrap_or_default(),
+                                    if include_labels {
+                                        format!(" (labels: {:?})", f.label_info.unwrap_or_default())
+                                    } else {
+                                        "".to_string()
+                                    }
                                 )
                             })
                         })
@@ -1276,6 +1322,7 @@ impl GoogleDriveRouter {
     async fn get_google_file(
         &self,
         uri: &str,
+        mime_type: &str,
         include_images: bool,
     ) -> Result<Vec<Content>, ToolError> {
         let result = self
@@ -1294,10 +1341,6 @@ impl GoogleDriveRouter {
                 uri, e
             ))),
             Ok(r) => {
-                let file = r.1;
-                let mime_type = file
-                    .mime_type
-                    .unwrap_or("application/octet-stream".to_string());
                 if mime_type.starts_with("text/") || mime_type == "application/json" {
                     if let Ok(body) = r.0.into_body().collect().await {
                         if let Ok(response) = String::from_utf8(body.to_bytes().to_vec()) {
@@ -1400,7 +1443,8 @@ impl GoogleDriveRouter {
             self.export_google_file(&drive_uri, &mime_type, include_images)
                 .await
         } else {
-            self.get_google_file(&drive_uri, include_images).await
+            self.get_google_file(&drive_uri, &mime_type, include_images)
+                .await
         }
     }
 
@@ -1922,7 +1966,8 @@ impl GoogleDriveRouter {
         }
     }
 
-    async fn upload(&self, params: Value) -> Result<Vec<Content>, ToolError> {
+    async fn create_file(&self, params: Value) -> Result<Vec<Content>, ToolError> {
+        // Extract common parameters
         let filename =
             params
                 .get("name")
@@ -1939,63 +1984,10 @@ impl GoogleDriveRouter {
                     "The mimeType param is required".to_string(),
                 ))?;
 
+        let parent_id = params.get("parentId").and_then(|q| q.as_str());
+        let target_id = params.get("targetId").and_then(|q| q.as_str());
         let body = params.get("body").and_then(|q| q.as_str());
         let path = params.get("path").and_then(|q| q.as_str());
-
-        let reader: Box<dyn ReadSeek> = match (body, path) {
-            (None, None) | (Some(_), Some(_)) => {
-                return Err(ToolError::InvalidParameters(
-                    "Either the body or path param is required".to_string(),
-                ))
-            }
-            (Some(b), None) => Box::new(Cursor::new(b.as_bytes().to_owned())),
-            (None, Some(p)) => Box::new(std::fs::File::open(p).map_err(|e| {
-                ToolError::ExecutionError(format!("Error opening {}: {}", p, e).to_string())
-            })?),
-        };
-
-        let parent_id = params.get("parentId").and_then(|q| q.as_str());
-
-        let allow_shared_drives = params
-            .get("allowSharedDrives")
-            .and_then(|q| q.as_bool())
-            .unwrap_or_default();
-
-        self.upload_to_drive(
-            FileOperation::Create {
-                name: filename.to_string(),
-            },
-            reader,
-            mime_type,
-            mime_type,
-            parent_id,
-            allow_shared_drives,
-            None,
-        )
-        .await
-    }
-
-    async fn create_file(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        // Extract common parameters
-        let filename =
-            params
-                .get("name")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The name param is required".to_string(),
-                ))?;
-
-        let file_type =
-            params
-                .get("fileType")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The fileType param is required".to_string(),
-                ))?;
-
-        let parent_id = params.get("parentId").and_then(|q| q.as_str());
-
-        let target_id = params.get("targetId").and_then(|q| q.as_str());
 
         let allow_shared_drives = params
             .get("allowSharedDrives")
@@ -2004,81 +1996,93 @@ impl GoogleDriveRouter {
 
         // Determine source and target MIME types based on file_type
         let (source_mime_type, target_mime_type, reader): (String, String, Box<dyn ReadSeek>) =
-            match file_type {
-                "document" => {
-                    let body = params.get("body").and_then(|q| q.as_str()).ok_or(
-                        ToolError::InvalidParameters(
-                            "The body param is required for document file type".to_string(),
-                        ),
-                    )?;
+            match mime_type {
+                "application/vnd.google-apps.document" => {
+                    if body.is_none() {
+                        return Err(ToolError::InvalidParameters(
+                            "The body param is required for google document file type".to_string(),
+                        ));
+                    }
 
                     (
                         "text/markdown".to_string(),
-                        "application/vnd.google-apps.document".to_string(),
-                        Box::new(Cursor::new(body.as_bytes().to_owned())),
+                        mime_type.to_string(),
+                        Box::new(Cursor::new(body.unwrap().as_bytes().to_owned())),
                     )
                 }
-                "spreadsheet" => {
-                    let body = params.get("body").and_then(|q| q.as_str()).ok_or(
-                        ToolError::InvalidParameters(
-                            "The body param is required for spreadsheet file type".to_string(),
-                        ),
-                    )?;
+                "application/vnd.google-apps.spreadsheet" => {
+                    if body.is_none() {
+                        return Err(ToolError::InvalidParameters(
+                            "The body param is required for google spreadsheet file type"
+                                .to_string(),
+                        ));
+                    }
+
                     (
                         "text/csv".to_string(),
-                        "application/vnd.google-apps.spreadsheet".to_string(),
-                        Box::new(Cursor::new(body.as_bytes().to_owned())),
+                        mime_type.to_string(),
+                        Box::new(Cursor::new(body.unwrap().as_bytes().to_owned())),
                     )
                 }
-                "slides" => {
-                    let path = params.get("path").and_then(|q| q.as_str()).ok_or(
-                        ToolError::InvalidParameters(
-                            "The path param is required for slides file type".to_string(),
-                        ),
-                    )?;
+                "application/vnd.google-apps.presentation" => {
+                    if path.is_none() {
+                        return Err(ToolError::InvalidParameters(
+                            "The path param is required for google slides file type".to_string(),
+                        ));
+                    }
 
-                    let file = std::fs::File::open(path).map_err(|e| {
+                    let file = std::fs::File::open(path.unwrap()).map_err(|e| {
                         ToolError::ExecutionError(
-                            format!("Error opening {}: {}", path, e).to_string(),
+                            format!("Error opening {}: {}", path.unwrap(), e).to_string(),
                         )
                     })?;
 
                     (
                         "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                             .to_string(),
-                        "application/vnd.google-apps.presentation".to_string(),
+                        mime_type.to_string(),
                         Box::new(file),
                     )
                 }
-                "folder" => {
+                "application/vnd.google-apps.folder" => {
                     let emptybuf: [u8; 0] = [];
                     let empty_stream = Cursor::new(emptybuf);
                     (
-                        "application/vnd.google-apps.folder".to_string(),
-                        "application/vnd.google-apps.folder".to_string(),
+                        mime_type.to_string(),
+                        mime_type.to_string(),
                         Box::new(empty_stream),
                     )
                 }
-                "shortcut" => {
+                "application/vnd.google-apps.shortcut" => {
                     if target_id.is_none() {
                         return Err(ToolError::InvalidParameters(
                             "The targetId param is required when creating a shortcut".to_string(),
-                        ))
+                        ));
                     }
                     let emptybuf: [u8; 0] = [];
                     let empty_stream = Cursor::new(emptybuf);
                     (
-                        "application/vnd.google-apps.shortcut".to_string(),
-                        "application/vnd.google-apps.shortcut".to_string(),
+                        mime_type.to_string(),
+                        mime_type.to_string(),
                         Box::new(empty_stream),
                     )
                 }
 
                 _ => {
-                    return Err(ToolError::InvalidParameters(format!(
-                        "Invalid fileType: {}. Supported types are: document, spreadsheet, slides, folder, shortcut",
-                        file_type
-                    )))
+                    let reader: Box<dyn ReadSeek> = match (body, path) {
+                        (None, None) | (Some(_), Some(_)) => {
+                            return Err(ToolError::InvalidParameters(
+                                "Either the body or path param is required".to_string(),
+                            ))
+                        }
+                        (Some(b), None) => Box::new(Cursor::new(b.as_bytes().to_owned())),
+                        (None, Some(p)) => Box::new(std::fs::File::open(p).map_err(|e| {
+                            ToolError::ExecutionError(
+                                format!("Error opening {}: {}", p, e).to_string(),
+                            )
+                        })?),
+                    };
+                    (mime_type.to_string(), mime_type.to_string(), reader)
                 }
             };
 
@@ -2150,128 +2154,241 @@ impl GoogleDriveRouter {
                     "The fileId param is required".to_string(),
                 ))?;
 
-        let mime_type =
-            params
-                .get("mimeType")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The mimeType param is required".to_string(),
-                ))?;
+        let allow_shared_drives = params
+            .get("allowSharedDrives")
+            .and_then(|q| q.as_bool())
+            .unwrap_or_default();
 
+        let mime_type = params.get("mimeType").and_then(|q| q.as_str());
         let body = params.get("body").and_then(|q| q.as_str());
         let path = params.get("path").and_then(|q| q.as_str());
 
-        let reader: Box<dyn ReadSeek> = match (body, path) {
-            (None, None) | (Some(_), Some(_)) => {
-                return Err(ToolError::InvalidParameters(
-                    "Either the body or path param is required".to_string(),
-                ))
-            }
-            (Some(b), None) => Box::new(Cursor::new(b.as_bytes().to_owned())),
-            (None, Some(p)) => Box::new(std::fs::File::open(p).map_err(|e| {
-                ToolError::ExecutionError(format!("Error opening {}: {}", p, e).to_string())
-            })?),
+        let mut final_result = vec![];
+
+        if mime_type.is_some() && (body.is_some() || path.is_some()) {
+            let update_result = self
+                .update_file_contents(file_id, mime_type.unwrap(), body, path, allow_shared_drives)
+                .await?;
+            final_result.extend(update_result);
         };
 
-        let allow_shared_drives = params
-            .get("allowSharedDrives")
-            .and_then(|q| q.as_bool())
-            .unwrap_or_default();
-
-        self.upload_to_drive(
-            FileOperation::Update {
-                file_id: file_id.to_string(),
-            },
-            reader,
-            mime_type,
-            mime_type,
-            None,
-            allow_shared_drives,
-            None,
-        )
-        .await
+        if let Some(label_ops) = params.get("updateLabels").and_then(|q| q.as_array()) {
+            let label_result = self.update_label(file_id, label_ops).await?;
+            final_result.extend(label_result);
+        };
+        Ok(final_result)
     }
 
-    async fn update_google_file(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        // Extract common parameters
-        let file_id =
-            params
-                .get("fileId")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The fileId param is required".to_string(),
-                ))?;
+    async fn update_label(
+        &self,
+        file_id: &str,
+        label_ops: &Vec<Value>,
+    ) -> Result<Vec<Content>, ToolError> {
+        let mut req = ModifyLabelsRequest::default();
+        let mut label_mods = vec![];
 
-        let file_type =
-            params
-                .get("fileType")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The fileType param is required".to_string(),
-                ))?;
+        for op in label_ops {
+            if let Some(op) = op.as_object() {
+                let label_id = op.get("labelId").and_then(|o| o.as_str()).ok_or(
+                    ToolError::InvalidParameters(
+                        "The labelId param is required for label changes".to_string(),
+                    ),
+                )?;
+                match op.get("operation").and_then(|o| o.as_str()) {
+                    Some("removeLabel") => {
+                        let removal = LabelModification {
+                            label_id: Some(label_id.to_string()),
+                            remove_label: Some(true),
+                            ..Default::default()
+                        };
+                        label_mods.push(removal);
+                    }
+                    Some("unsetField") => {
+                        let field_id = op.get("fieldId").and_then(|o| o.as_str()).ok_or(
+                            ToolError::InvalidParameters(
+                                "The fieldId param is required for unsetting a field.".to_string(),
+                            ),
+                        )?;
+                        let field_mods = LabelFieldModification {
+                            field_id: Some(field_id.to_string()),
+                            unset_values: Some(true),
+                            ..Default::default()
+                        };
+                        let unset_mod = LabelModification {
+                            label_id: Some(label_id.to_string()),
+                            field_modifications: Some(vec![field_mods]),
+                            ..Default::default()
+                        };
+                        label_mods.push(unset_mod);
+                    }
+                    Some("addOrUpdateLabel") => {
+                        let mut field_mods = LabelFieldModification::default();
+                        // Not all labels _have_ fields.
+                        if let Some(field_id) = op.get("fieldId").and_then(|o| o.as_str()) {
+                            field_mods.field_id = Some(field_id.to_string());
+                        }
 
-        let allow_shared_drives = params
-            .get("allowSharedDrives")
-            .and_then(|q| q.as_bool())
-            .unwrap_or_default();
+                        if let Some(date_value) = op.get("dateValue").and_then(|o| o.as_array()) {
+                            let parsed_dates: Result<Vec<NaiveDate>, ToolError> = date_value
+                                .iter()
+                                .filter_map(|d| d.as_str())
+                                .map(|d| {
+                                    NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
+                                        ToolError::InvalidParameters(format!(
+                                            "Error parsing field date: {}",
+                                            e
+                                        ))
+                                    })
+                                })
+                                .collect();
 
+                            field_mods.set_date_values = Some(parsed_dates?);
+                        } else if let Some(text_value) =
+                            op.get("textValue").and_then(|o| o.as_array())
+                        {
+                            field_mods.set_text_values = Some(
+                                text_value
+                                    .iter()
+                                    .map(|s| s.as_str().unwrap_or_default().to_string())
+                                    .collect(),
+                            );
+                        } else if let Some(choice_value) =
+                            op.get("choiceValue").and_then(|o| o.as_array())
+                        {
+                            field_mods.set_selection_values = Some(
+                                choice_value
+                                    .iter()
+                                    .map(|s| s.as_str().unwrap_or_default().to_string())
+                                    .collect(),
+                            );
+                        } else if let Some(int_value) =
+                            op.get("integerValue").and_then(|o| o.as_array())
+                        {
+                            field_mods.set_integer_values = Some(
+                                int_value
+                                    .iter()
+                                    .map(|s| s.as_i64().unwrap_or_default())
+                                    .collect(),
+                            );
+                        } else if let Some(user_value) =
+                            op.get("userValue").and_then(|o| o.as_array())
+                        {
+                            field_mods.set_user_values = Some(
+                                user_value
+                                    .iter()
+                                    .map(|s| s.as_str().unwrap_or_default().to_string())
+                                    .collect(),
+                            );
+                        }
+
+                        let update_mod = LabelModification {
+                            label_id: Some(label_id.to_string()),
+                            field_modifications: Some(vec![field_mods]),
+                            ..Default::default()
+                        };
+                        label_mods.push(update_mod);
+                    }
+                    _ => {
+                        return Err(ToolError::InvalidParameters(format!(
+                            "Label operation invalid: {:?}",
+                            op.get("operation")
+                        )))
+                    }
+                }
+            };
+        }
+        req.label_modifications = Some(label_mods);
+
+        let result = self.drive.files().modify_labels(req, file_id).doit().await;
+        match result {
+            Err(e) => Err(ToolError::ExecutionError(format!(
+                "Failed to update label for google drive file {}, {}.",
+                file_id, e
+            ))),
+            Ok(r) => Ok(vec![Content::text(format!(
+                "file URI: {}, labels modified: {:?}",
+                file_id,
+                r.1.modified_labels.unwrap_or_default()
+            ))]),
+        }
+    }
+
+    async fn update_file_contents(
+        &self,
+        file_id: &str,
+        mime_type: &str,
+        body: Option<&str>,
+        path: Option<&str>,
+        allow_shared_drives: bool,
+    ) -> Result<Vec<Content>, ToolError> {
         // Determine source and target MIME types based on file_type
         let (source_mime_type, target_mime_type, reader): (String, String, Box<dyn ReadSeek>) =
-            match file_type {
-                "document" => {
-                    let body = params.get("body").and_then(|q| q.as_str()).ok_or(
-                        ToolError::InvalidParameters(
-                            "The body param is required for document file type".to_string(),
-                        ),
-                    )?;
+            match mime_type {
+                "application/vnd.google-apps.document" => {
+                    if body.is_none() {
+                        return Err(ToolError::InvalidParameters(
+                            "The body param is required for google document file type".to_string(),
+                        ));
+                    }
 
                     (
                         "text/markdown".to_string(),
-                        "application/vnd.google-apps.document".to_string(),
-                        Box::new(Cursor::new(body.as_bytes().to_owned())),
+                        mime_type.to_string(),
+                        Box::new(Cursor::new(body.unwrap().as_bytes().to_owned())),
                     )
                 }
-                "spreadsheet" => {
-                    let body = params.get("body").and_then(|q| q.as_str()).ok_or(
-                        ToolError::InvalidParameters(
-                            "The body param is required for spreadsheet file type".to_string(),
-                        ),
-                    )?;
+                "application/vnd.google-apps.spreadsheet" => {
+                    if body.is_none() {
+                        return Err(ToolError::InvalidParameters(
+                            "The body param is required for google spreadsheet file type"
+                                .to_string(),
+                        ));
+                    }
+
                     (
                         "text/csv".to_string(),
-                        "application/vnd.google-apps.spreadsheet".to_string(),
-                        Box::new(Cursor::new(body.as_bytes().to_owned())),
+                        mime_type.to_string(),
+                        Box::new(Cursor::new(body.unwrap().as_bytes().to_owned())),
                     )
                 }
-                "slides" => {
-                    let path = params.get("path").and_then(|q| q.as_str()).ok_or(
-                        ToolError::InvalidParameters(
-                            "The path param is required for slides file type".to_string(),
-                        ),
-                    )?;
+                "application/vnd.google-apps.presentation" => {
+                    if path.is_none() {
+                        return Err(ToolError::InvalidParameters(
+                            "The path param is required for google slides file type".to_string(),
+                        ));
+                    }
 
-                    let file = std::fs::File::open(path).map_err(|e| {
+                    let file = std::fs::File::open(path.unwrap()).map_err(|e| {
                         ToolError::ExecutionError(
-                            format!("Error opening {}: {}", path, e).to_string(),
+                            format!("Error opening {}: {}", path.unwrap(), e).to_string(),
                         )
                     })?;
 
                     (
                         "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                             .to_string(),
-                        "application/vnd.google-apps.presentation".to_string(),
+                        mime_type.to_string(),
                         Box::new(file),
                     )
                 }
                 _ => {
-                    return Err(ToolError::InvalidParameters(format!(
-                        "Invalid fileType: {}. Supported types are: document, spreadsheet, slides",
-                        file_type
-                    )))
+                    let reader: Box<dyn ReadSeek> = match (body, path) {
+                        (None, None) | (Some(_), Some(_)) => {
+                            return Err(ToolError::InvalidParameters(
+                                "Either the body or path param is required".to_string(),
+                            ))
+                        }
+                        (Some(b), None) => Box::new(Cursor::new(b.as_bytes().to_owned())),
+                        (None, Some(p)) => Box::new(std::fs::File::open(p).map_err(|e| {
+                            ToolError::ExecutionError(
+                                format!("Error opening {}: {}", p, e).to_string(),
+                            )
+                        })?),
+                    };
+                    (mime_type.to_string(), mime_type.to_string(), reader)
                 }
             };
 
-        // Upload the file to Google Drive
         self.upload_to_drive(
             FileOperation::Update {
                 file_id: file_id.to_string(),
@@ -2351,7 +2468,7 @@ impl GoogleDriveRouter {
         Ok(vec![Content::text(results.join("\n"))])
     }
 
-    async fn create_comment(&self, params: Value) -> Result<Vec<Content>, ToolError> {
+    async fn manage_comment(&self, params: Value) -> Result<Vec<Content>, ToolError> {
         let file_id =
             params
                 .get("fileId")
@@ -2359,54 +2476,8 @@ impl GoogleDriveRouter {
                 .ok_or(ToolError::InvalidParameters(
                     "The fileId param is required".to_string(),
                 ))?;
-        let comment =
-            params
-                .get("comment")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The comment param is required".to_string(),
-                ))?;
-
-        let req = Comment {
-            content: Some(comment.to_string()),
-            ..Default::default()
-        };
-        let result = self
-            .drive
-            .comments()
-            .create(req, file_id)
-            .clear_scopes() // Scope::MeetReadonly is the default, remove it
-            .add_scope(GOOGLE_DRIVE_SCOPES)
-            .param("fields", "*")
-            // .param("fields", "action, author, content, createdTime, id")
-            .doit()
-            .await;
-        match result {
-            Err(e) => Err(ToolError::ExecutionError(format!(
-                "Failed to add comment for google drive file {}, {}.",
-                file_id, e
-            ))),
-            Ok(r) => Ok(vec![Content::text(format!(
-                "Author: {:?} Content: {} Created: {} uri: {} quoted_content: {:?}",
-                r.1.author.unwrap_or_default(),
-                r.1.content.unwrap_or_default(),
-                r.1.created_time.unwrap_or_default(),
-                r.1.id.unwrap_or_default(),
-                r.1.quoted_file_content.unwrap_or_default()
-            ))]),
-        }
-    }
-
-    async fn reply(&self, params: Value) -> Result<Vec<Content>, ToolError> {
-        let file_id =
-            params
-                .get("fileId")
-                .and_then(|q| q.as_str())
-                .ok_or(ToolError::InvalidParameters(
-                    "The fileId param is required".to_string(),
-                ))?;
-        let comment_id = params.get("commentId").and_then(|q| q.as_str()).ok_or(
-            ToolError::InvalidParameters("The commentId param is required".to_string()),
+        let operation = params.get("operation").and_then(|q| q.as_str()).ok_or(
+            ToolError::InvalidParameters("The operation is required".to_string()),
         )?;
         let content =
             params
@@ -2415,41 +2486,86 @@ impl GoogleDriveRouter {
                 .ok_or(ToolError::InvalidParameters(
                     "The content param is required if the action is create".to_string(),
                 ))?;
-        let resolve_comment = params
-            .get("resolveComment")
-            .and_then(|q| q.as_bool())
-            .unwrap_or(false);
 
-        let mut req = Reply {
-            content: Some(content.to_string()),
-            ..Default::default()
-        };
+        match operation {
+            "create" => {
+                let req = Comment {
+                    content: Some(content.to_string()),
+                    ..Default::default()
+                };
+                let result = self
+                    .drive
+                    .comments()
+                    .create(req, file_id)
+                    .clear_scopes() // Scope::MeetReadonly is the default, remove it
+                    .add_scope(GOOGLE_DRIVE_SCOPES)
+                    .param("fields", "*")
+                    // .param("fields", "action, author, content, createdTime, id")
+                    .doit()
+                    .await;
+                match result {
+                    Err(e) => Err(ToolError::ExecutionError(format!(
+                        "Failed to add comment for google drive file {}, {}.",
+                        file_id, e
+                    ))),
+                    Ok(r) => Ok(vec![Content::text(format!(
+                        "Author: {:?} Content: {} Created: {} uri: {} quoted_content: {:?}",
+                        r.1.author.unwrap_or_default(),
+                        r.1.content.unwrap_or_default(),
+                        r.1.created_time.unwrap_or_default(),
+                        r.1.id.unwrap_or_default(),
+                        r.1.quoted_file_content.unwrap_or_default()
+                    ))]),
+                }
+            }
+            "reply" => {
+                let comment_id = params.get("commentId").and_then(|q| q.as_str()).ok_or(
+                    ToolError::InvalidParameters(
+                        "The commentId param is required for reply".to_string(),
+                    ),
+                )?;
 
-        if resolve_comment {
-            req.action = Some("resolve".to_string());
-        }
-        let result = self
-            .drive
-            .replies()
-            .create(req, file_id, comment_id)
-            .clear_scopes() // Scope::MeetReadonly is the default, remove it
-            .add_scope(GOOGLE_DRIVE_SCOPES)
-            .param("fields", "action, author, content, createdTime, id")
-            .doit()
-            .await;
-        match result {
-            Err(e) => Err(ToolError::ExecutionError(format!(
-                "Failed to manage reply to comment {} for google drive file {}, {}.",
-                comment_id, file_id, e
+                let resolve_comment = params
+                    .get("resolveComment")
+                    .and_then(|q| q.as_bool())
+                    .unwrap_or(false);
+
+                let mut req = Reply {
+                    content: Some(content.to_string()),
+                    ..Default::default()
+                };
+
+                if resolve_comment {
+                    req.action = Some("resolve".to_string());
+                }
+                let result = self
+                    .drive
+                    .replies()
+                    .create(req, file_id, comment_id)
+                    .clear_scopes() // Scope::MeetReadonly is the default, remove it
+                    .add_scope(GOOGLE_DRIVE_SCOPES)
+                    .param("fields", "action, author, content, createdTime, id")
+                    .doit()
+                    .await;
+                match result {
+                    Err(e) => Err(ToolError::ExecutionError(format!(
+                        "Failed to manage reply to comment {} for google drive file {}, {}.",
+                        comment_id, file_id, e
+                    ))),
+                    Ok(r) => Ok(vec![Content::text(format!(
+                        "Action: {} Author: {:?} Content: {} Created: {} uri: {}",
+                        r.1.action.unwrap_or_default(),
+                        r.1.author.unwrap_or_default(),
+                        r.1.content.unwrap_or_default(),
+                        r.1.created_time.unwrap_or_default(),
+                        r.1.id.unwrap_or_default()
+                    ))]),
+                }
+            }
+            _ => Err(ToolError::InvalidParameters(format!(
+                "Invalid operation: {}. Supported operations are: create, reply",
+                operation
             ))),
-            Ok(r) => Ok(vec![Content::text(format!(
-                "Action: {} Author: {:?} Content: {} Created: {} uri: {}",
-                r.1.action.unwrap_or_default(),
-                r.1.author.unwrap_or_default(),
-                r.1.content.unwrap_or_default(),
-                r.1.created_time.unwrap_or_default(),
-                r.1.id.unwrap_or_default()
-            ))]),
         }
     }
 
@@ -3102,6 +3218,43 @@ impl GoogleDriveRouter {
             )),
         }
     }
+
+    async fn list_labels(&self, _params: Value) -> Result<Vec<Content>, ToolError> {
+        let builder = self
+            .drive_labels
+            .labels()
+            .list()
+            .param("view", "LABEL_VIEW_FULL");
+
+        let result = builder.doit().await;
+        match result {
+            Err(e) => Err(ToolError::ExecutionError(format!(
+                "Failed to list labels for Google Drive {}",
+                e
+            ))),
+            Ok(r) => {
+                let content =
+                    r.1.labels
+                        .map(|labels| {
+                            labels.into_iter().map(|l| {
+                                format!(
+                                    "name: {} label_type: {} properties: {:?} uri: {} fields: {:?}",
+                                    l.name.unwrap_or_default(),
+                                    l.label_type.unwrap_or_default(),
+                                    l.properties.unwrap_or_default(),
+                                    l.id.unwrap_or_default(),
+                                    l.fields.unwrap_or_default()
+                                )
+                            })
+                        })
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                Ok(vec![Content::text(content.to_string()).with_priority(0.3)])
+            }
+        }
+    }
 }
 
 impl Router for GoogleDriveRouter {
@@ -3135,16 +3288,13 @@ impl Router for GoogleDriveRouter {
             match tool_name.as_str() {
                 "search" => this.search(arguments).await,
                 "read" => this.read(arguments).await,
-                "upload" => this.upload(arguments).await,
                 "create_file" => this.create_file(arguments).await,
                 "move_file" => this.move_file(arguments).await,
                 "update_file" => this.update_file(arguments).await,
-                "update_google_file" => this.update_google_file(arguments).await,
                 "sheets_tool" => this.sheets_tool(arguments).await,
                 "docs_tool" => this.docs_tool(arguments).await,
-                "create_comment" => this.create_comment(arguments).await,
+                "manage_comment" => this.manage_comment(arguments).await,
                 "get_comments" => this.get_comments(arguments).await,
-                "reply" => this.reply(arguments).await,
                 "list_drives" => this.list_drives(arguments).await,
                 "get_permissions" => this.get_permissions(arguments).await,
                 "sharing" => this.sharing(arguments).await,
@@ -3193,6 +3343,7 @@ impl Clone for GoogleDriveRouter {
             tools: self.tools.clone(),
             instructions: self.instructions.clone(),
             drive: self.drive.clone(),
+            drive_labels: self.drive_labels.clone(),
             sheets: self.sheets.clone(),
             docs: self.docs.clone(),
             credentials_manager: self.credentials_manager.clone(),

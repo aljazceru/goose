@@ -9,6 +9,7 @@ import { IconDownload } from "@site/src/components/icons/download";
 import SupportedEnvironments from '@site/src/components/SupportedEnvironments';
 import RateLimits from '@site/src/components/RateLimits';
 import YouTubeShortEmbed from '@site/src/components/YouTubeShortEmbed';
+import DesktopInstallButtons from '@site/src/components/DesktopInstallButtons';
 
 
 # Goose in 5 minutes
@@ -21,54 +22,72 @@ Goose is an open source AI agent that supercharges your software development by 
 
 ## Install Goose
 
-You can use Goose via CLI or Desktop application.
+<Tabs>
+  <TabItem value="mac" label="macOS" default>
+    Choose to install Goose on CLI and/or Desktop:
 
-<Tabs groupId="interface">
-  <TabItem value="cli" label="Goose CLI">
-  <details>
-  <summary>Quickstart Video Demo</summary>
-    <iframe
-    class="aspect-ratio"
-    src="https://www.youtube.com/embed/SbomoGzTRQY"
-    title="Getting started with the Goose CLI"
-    frameBorder="0"
-    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-    allowFullScreen
-    ></iframe>
-  </details>
+    <Tabs groupId="interface">
+      <TabItem value="ui" label="Goose Desktop" default>
+        <DesktopInstallButtons/>
+        <div style={{ marginTop: '1rem' }}>
+          1. Unzip the downloaded zip file.
+          2. Run the executable file to launch the Goose Desktop application.
+        </div>
+      </TabItem>
+      <TabItem value="cli" label="Goose CLI">
+        Run the following command to install Goose:
 
-    Run the following command to install the latest version of Goose:
-
-    ```sh
-    curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash
-    ```
+        ```sh
+        curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash
+        ```
+      </TabItem>
+    </Tabs>
   </TabItem>
-  <TabItem value="ui" label="Goose Desktop (macOS only)" default>
-    <details>
-    <summary>Quickstart Video Demo</summary>
-      <iframe
-      class="aspect-ratio"
-      src="https://www.youtube.com/embed/_i9Dhz7eo58"
-      title="Getting started with Goose Desktop"
-      frameBorder="0"
-      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-      allowFullScreen
-      ></iframe>
-    </details>
-    To install the latest version of Goose, click the **button** below:
-    <div className="pill-button">
-      <Link
-        className="button button--primary button--lg"
-        to="https://github.com/block/goose/releases/download/stable/Goose.zip"
-      >
-        <IconDownload />
-        download goose desktop for macOS
-      </Link>
-    </div>
-    <div style={{ marginTop: '1rem' }}>
-      1. Unzip the downloaded `Goose.zip` file.
-      2. Run the executable file to launch the Goose desktop application.
-    </div>
+
+  <TabItem value="linux" label="Linux">
+    <Tabs groupId="interface">
+      <TabItem value="ui" label="Goose Desktop" default>
+        Desktop version is currently unavailable for Linux.
+      </TabItem>
+      <TabItem value="cli" label="Goose CLI">
+        Run the following command to install the Goose CLI on Linux:
+
+        ```sh
+        curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash
+        ```   
+      </TabItem>
+    </Tabs>
+  </TabItem>
+
+  <TabItem value="windows" label="Windows">
+    <Tabs groupId="interface">
+      <TabItem value="ui" label="Goose Desktop" default>
+        Desktop version is currently unavailable for Windows.
+      </TabItem>
+      <TabItem value="cli" label="Goose CLI">
+        There isn't native installation support for Windows, however you can run Goose using WSL (Windows Subsystem for Linux).
+
+        1. Open [PowerShell](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows) as Administrator and install WSL and the default Ubuntu distribution:
+
+        ```bash
+        wsl --install
+        ```
+
+        2. Restart your computer if prompted.
+
+        3. Run the Goose installation script:
+        ```bash
+        curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash
+        ```
+        :::tip
+          If you encounter any issues on download, you might need to install `bzip2` to extract the downloaded file:
+
+          ```bash
+          sudo apt update && sudo apt install bzip2 -y
+          ```
+        :::
+      </TabItem>
+    </Tabs>
   </TabItem>
 </Tabs>
 
@@ -77,6 +96,9 @@ You can use Goose via CLI or Desktop application.
 Goose works with [supported LLM providers][providers]. When you install Goose, you'll be prompted to choose your preferred LLM and supply an API key.
 
 <Tabs groupId="interface">
+  <TabItem value="ui" label="Goose Desktop" default>
+    ![Set Up a Provider UI](./assets/guides/set-up-provider-ui.png)
+  </TabItem>
   <TabItem value="cli" label="Goose CLI">
     Use the up and down arrow keys to navigate the CLI menu, and press Enter once you've selected a choice.
 
@@ -99,9 +121,6 @@ Goose works with [supported LLM providers][providers]. When you install Goose, y
     │
     └ Configuration saved successfully
   ```
-  </TabItem>
-  <TabItem value="ui" label="Goose Desktop" default>
-    ![Set Up a Provider UI](./assets/guides/set-up-provider-ui.png)
   </TabItem>
 </Tabs>
 
