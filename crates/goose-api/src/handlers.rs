@@ -10,6 +10,7 @@ use goose::message::{Message, MessageContent};
 use goose::session::{self, Identifier};
 use goose::config::Config;
 use std::sync::LazyLock;
+use crate::api_sessions::{ApiSession, SESSIONS, cleanup_expired_sessions};
 use std::collections::HashMap;
 
 pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| ExtensionManager::default());
@@ -118,15 +119,30 @@ pub async fn start_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Starting session with prompt: {}", req.prompt);
 
-    let agent = AGENT.lock().await;
+    cleanup_expired_sessions();
+
+    // create fresh agent using provider from the template agent
+    let template = AGENT.lock().await;
+    let mut new_agent = Agent::new();
+    if let Ok(provider) = template.provider().await {
+        let _ = new_agent.update_provider(provider).await;
+    }
+    drop(template);
+
     let mut messages = vec![Message::user().with_text(&req.prompt)];
     let session_id = Uuid::new_v4();
     let session_name = session_id.to_string();
     let session_path = session::get_path(Identifier::Name(session_name.clone()));
 
-    let provider = agent.provider().await.ok();
+    let session = ApiSession::new(new_agent);
+    let agent_ref = session.agent.clone();
+    SESSIONS.insert(session_id, session);
 
-    let result = agent
+    let provider = agent_ref.lock().await.provider().await.ok();
+
+    let result = agent_ref
+        .lock()
+        .await
         .reply(
             &messages,
             Some(SessionConfig {
@@ -215,10 +231,27 @@ pub async fn reply_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Replying to session with prompt: {}", req.prompt);
 
-    let agent = AGENT.lock().await;
+    cleanup_expired_sessions();
 
     let session_name = req.session_id.to_string();
     let session_path = session::get_path(Identifier::Name(session_name.clone()));
+
+    let session_entry = match SESSIONS.get(&req.session_id) {
+        Some(s) => s,
+        None => {
+            let response = ApiResponse {
+                message: "Session not found".to_string(),
+                status: "error".to_string(),
+            };
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&response),
+                warp::http::StatusCode::NOT_FOUND,
+            ));
+        }
+    };
+    session_entry.touch();
+    let agent_ref = session_entry.agent.clone();
+    drop(session_entry);
 
     let mut messages = match session::read_messages(&session_path) {
         Ok(m) => m,
@@ -236,9 +269,11 @@ pub async fn reply_session_handler(
 
     messages.push(Message::user().with_text(&req.prompt));
 
-    let provider = agent.provider().await.ok();
+    let provider = agent_ref.lock().await.provider().await.ok();
 
-    let result = agent
+    let result = agent_ref
+        .lock()
+        .await
         .reply(
             &messages,
             Some(SessionConfig {
@@ -319,8 +354,13 @@ pub async fn end_session_handler(
     req: EndSessionRequest,
     _api_key: String,
 ) -> Result<impl warp::Reply, Rejection> {
+    cleanup_expired_sessions();
+
     let session_name = req.session_id.to_string();
     let session_path = session::get_path(Identifier::Name(session_name.clone()));
+
+    // remove in-memory agent if present
+    SESSIONS.remove(&req.session_id);
 
     if std::fs::remove_file(&session_path).is_ok() {
         let response = ApiResponse {

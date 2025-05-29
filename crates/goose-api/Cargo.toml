@@ -21,6 +21,7 @@ futures = "0.3"
 futures-util = "0.3"
 # For session IDs
 uuid = { version = "1", features = ["serde", "v4"] }
+dashmap = "6"
  # Add dynamic-library for extension loading
 
 [dev-dependencies]
