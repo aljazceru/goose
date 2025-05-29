@@ -5,8 +5,6 @@ edition = "2021"
 
 [dependencies]
 goose = { path = "../goose" }
-goose-mcp = { path = "../goose-mcp" }
-mcp-client = { path = "../mcp-client" }
 mcp-core = { path = "../mcp-core" }
 tokio = { version = "1", features = ["full"] }
 warp = "0.3"
@@ -16,7 +14,6 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 config = "0.13"
-jsonwebtoken = "8"
 futures = "0.3"
 futures-util = "0.3"
 # For session IDs
