@@ -430,9 +430,15 @@ pub async fn remove_extension_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Removing extension: {}", name);
     let agent = AGENT.lock().await;
-    agent.remove_extension(&name).await;
+    let result = agent.remove_extension(&name).await;
 
-    let resp = ExtensionResponse { error: false, message: None };
+    let resp = match result {
+        Ok(_) => ExtensionResponse { error: false, message: None },
+        Err(e) => ExtensionResponse {
+            error: true,
+            message: Some(format!("Failed to remove extension, error: {:?}", e)),
+        },
+    };
     Ok(warp::reply::json(&resp))
 }
 
