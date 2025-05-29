@@ -355,14 +355,24 @@ The current implementation includes the following features from the implementati
 
 🟡 **Step 7**: Extension loading mechanism (partial implementation)  
 🟡 **Step 8**: MCP support (partial implementation)  
-✅ **Step 10**: Documentation  
-❌ **Step 11**: Tests (not yet implemented)  
+✅ **Step 10**: Documentation
+✅ **Step 11**: Tests
+
+## Running Tests
+
+Run all unit and integration tests with:
+
+```bash
+cargo test
+```
+
+This command executes the entire workspace test suite. To test a single crate, use `cargo test -p <crate>`.
 
 ## Future Work
 
 - Extend session management capabilities
 - Add more comprehensive error handling
-- Implement unit and integration tests
+- Expand unit and integration tests
 - Complete MCP integration
 - Add metrics and monitoring
 - Add OpenAPI documentation generation
