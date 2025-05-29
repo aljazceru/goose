@@ -223,12 +223,19 @@ impl SseActor {
 #[derive(Clone)]
 pub struct SseTransportHandle {
     sender: mpsc::Sender<TransportMessage>,
+    pending_requests: Arc<PendingRequests>,
 }
 
 #[async_trait::async_trait]
 impl TransportHandle for SseTransportHandle {
     async fn send(&self, message: JsonRpcMessage) -> Result<JsonRpcMessage, Error> {
         send_message(&self.sender, message).await
+    }
+}
+
+impl SseTransportHandle {
+    pub fn pending_requests(&self) -> Arc<PendingRequests> {
+        Arc::clone(&self.pending_requests)
     }
 }
 
@@ -284,9 +291,10 @@ impl Transport for SseTransport {
         let post_endpoint_clone = Arc::clone(&post_endpoint);
 
         // Build the actor
+        let pending_requests = Arc::new(PendingRequests::new());
         let actor = SseActor::new(
             rx,
-            Arc::new(PendingRequests::new()),
+            pending_requests.clone(),
             self.sse_url.clone(),
             post_endpoint,
         );
@@ -301,7 +309,7 @@ impl Transport for SseTransport {
         )
         .await
         {
-            Ok(_) => Ok(SseTransportHandle { sender: tx }),
+            Ok(_) => Ok(SseTransportHandle { sender: tx, pending_requests }),
             Err(e) => Err(Error::SseConnection(e.to_string())),
         }
     }

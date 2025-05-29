@@ -5,6 +5,7 @@ use crate::handlers::{
     add_extension_handler, end_session_handler, get_provider_config_handler,
     list_extensions_handler, remove_extension_handler, reply_session_handler,
     start_session_handler, summarize_session_handler, with_api_key,
+
 };
 use crate::config::{
     initialize_extensions, initialize_provider_config, load_configuration,
@@ -64,6 +65,10 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
         .and(warp::get())
         .and_then(get_provider_config_handler);
 
+    let metrics = warp::path("metrics")
+        .and(warp::get())
+        .and_then(metrics_handler);
+
     start_session
         .or(reply_session)
         .or(summarize_session)
@@ -72,6 +77,7 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
         .or(add_extension)
         .or(remove_extension)
         .or(get_provider_config)
+        .or(metrics)
 }
 
 pub async fn run_server() -> Result<(), anyhow::Error> {

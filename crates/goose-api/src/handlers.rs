@@ -6,10 +6,11 @@ use futures_util::TryStreamExt;
 use tracing::{info, warn, error};
 use mcp_core::tool::Tool;
 use goose::agents::{extension::Envs, extension_manager::ExtensionManager, ExtensionConfig, Agent, SessionConfig};
-use goose::message::Message;
+use goose::message::{Message, MessageContent};
 use goose::session::{self, Identifier};
 use goose::config::Config;
 use std::sync::LazyLock;
+use std::collections::HashMap;
 
 pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| ExtensionManager::default());
 pub static AGENT: LazyLock<tokio::sync::Mutex<Agent>> = LazyLock::new(|| tokio::sync::Mutex::new(Agent::new()));
@@ -63,6 +64,13 @@ pub struct ProviderConfig {
 pub struct ExtensionResponse {
     pub error: bool,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MetricsResponse {
+    pub session_messages: HashMap<String, usize>,
+    pub active_sessions: usize,
+    pub pending_requests: HashMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +140,30 @@ pub async fn start_session_handler(
     match result {
         Ok(mut stream) => {
             if let Ok(Some(response)) = stream.try_next().await {
+                if matches!(response.content.first(), Some(MessageContent::ContextLengthExceeded(_))) {
+                    match agent.summarize_context(&messages).await {
+                        Ok((summarized, _)) => {
+                            messages = summarized;
+                            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                                warn!("Failed to persist session {}: {}", session_name, e);
+                            }
+
+                            let api_response = StartSessionResponse {
+                                message: "Conversation summarized to fit context window".to_string(),
+                                status: "warning".to_string(),
+                                session_id,
+                            };
+                            return Ok(warp::reply::with_status(
+                                warp::reply::json(&api_response),
+                                warp::http::StatusCode::OK,
+                            ));
+                        }
+                        Err(e) => {
+                            warn!("Failed to summarize context: {}", e);
+                        }
+                    }
+                }
+
                 let response_text = response.as_concat_text();
                 messages.push(response);
                 if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
@@ -220,6 +252,28 @@ pub async fn reply_session_handler(
     match result {
         Ok(mut stream) => {
             if let Ok(Some(response)) = stream.try_next().await {
+                if matches!(response.content.first(), Some(MessageContent::ContextLengthExceeded(_))) {
+                    match agent.summarize_context(&messages).await {
+                        Ok((summarized, _)) => {
+                            messages = summarized;
+                            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                                warn!("Failed to persist session {}: {}", session_name, e);
+                            }
+                            let api_response = ApiResponse {
+                                message: "Conversation summarized to fit context window".to_string(),
+                                status: "warning".to_string(),
+                            };
+                            return Ok(warp::reply::with_status(
+                                warp::reply::json(&api_response),
+                                warp::http::StatusCode::OK,
+                            ));
+                        }
+                        Err(e) => {
+                            warn!("Failed to summarize context: {}", e);
+                        }
+                    }
+                }
+
                 let response_text = response.as_concat_text();
                 messages.push(response);
                 if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
@@ -505,6 +559,33 @@ pub async fn remove_extension_handler(
             message: Some(format!("Failed to remove extension, error: {:?}", e)),
         },
     };
+    Ok(warp::reply::json(&resp))
+}
+
+pub async fn metrics_handler() -> Result<impl warp::Reply, Rejection> {
+    // Gather session message counts
+    let mut session_messages = HashMap::new();
+    if let Ok(sessions) = session::list_sessions() {
+        for (name, path) in sessions {
+            if let Ok(messages) = session::read_messages(&path) {
+                session_messages.insert(name, messages.len());
+            }
+        }
+    }
+
+    let active_sessions = session_messages.len();
+
+    // Gather pending request sizes for each extension
+    let pending_requests = EXTENSION_MANAGER
+        .pending_request_sizes()
+        .await;
+
+    let resp = MetricsResponse {
+        session_messages,
+        active_sessions,
+        pending_requests,
+    };
+
     Ok(warp::reply::json(&resp))
 }
 
