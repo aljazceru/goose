@@ -136,6 +136,10 @@ pub enum ExtensionConfig {
         // NOTE: set timeout to be optional for compatibility.
         // However, new configurations should include this field.
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
         /// Whether this extension is bundled with Goose
         #[serde(default)]
         bundled: Option<bool>,
@@ -153,6 +157,10 @@ pub enum ExtensionConfig {
         env_keys: Vec<String>,
         timeout: Option<u64>,
         description: Option<String>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
         /// Whether this extension is bundled with Goose
         #[serde(default)]
         bundled: Option<bool>,
@@ -164,6 +172,10 @@ pub enum ExtensionConfig {
         name: String,
         display_name: Option<String>, // needed for the UI
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
         /// Whether this extension is bundled with Goose
         #[serde(default)]
         bundled: Option<bool>,
@@ -189,6 +201,8 @@ impl Default for ExtensionConfig {
             name: config::DEFAULT_EXTENSION.to_string(),
             display_name: Some(config::DEFAULT_DISPLAY_NAME.to_string()),
             timeout: Some(config::DEFAULT_EXTENSION_TIMEOUT),
+            max_pending_requests: Some(config::DEFAULT_MAX_PENDING_REQUESTS),
+            pending_request_timeout: Some(config::DEFAULT_PENDING_REQUEST_TIMEOUT),
             bundled: Some(true),
         }
     }
@@ -203,6 +217,8 @@ impl ExtensionConfig {
             env_keys: Vec::new(),
             description: Some(description.into()),
             timeout: Some(timeout.into()),
+            max_pending_requests: Some(config::DEFAULT_MAX_PENDING_REQUESTS),
+            pending_request_timeout: Some(config::DEFAULT_PENDING_REQUEST_TIMEOUT),
             bundled: None,
         }
     }
@@ -221,6 +237,8 @@ impl ExtensionConfig {
             env_keys: Vec::new(),
             description: Some(description.into()),
             timeout: Some(timeout.into()),
+            max_pending_requests: Some(config::DEFAULT_MAX_PENDING_REQUESTS),
+            pending_request_timeout: Some(config::DEFAULT_PENDING_REQUEST_TIMEOUT),
             bundled: None,
         }
     }
@@ -237,6 +255,8 @@ impl ExtensionConfig {
                 envs,
                 env_keys,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 description,
                 bundled,
                 ..
@@ -248,6 +268,8 @@ impl ExtensionConfig {
                 args: args.into_iter().map(Into::into).collect(),
                 description,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 bundled,
             },
             other => other,

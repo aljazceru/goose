@@ -29,6 +29,8 @@ async fn main() -> Result<(), ClientError> {
             .map(|s| s.to_string())
             .collect(),
         HashMap::new(),
+        None,
+        None,
     );
 
     // Start the transport to get a handle

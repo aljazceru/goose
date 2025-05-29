@@ -79,6 +79,8 @@ pub async fn handle_configure() -> Result<(), Box<dyn Error>> {
                         name: "developer".to_string(),
                         display_name: Some(goose::config::DEFAULT_DISPLAY_NAME.to_string()),
                         timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+                        max_pending_requests: Some(goose::config::DEFAULT_MAX_PENDING_REQUESTS),
+                        pending_request_timeout: Some(goose::config::DEFAULT_PENDING_REQUEST_TIMEOUT),
                         bundled: Some(true),
                     },
                 })?;
@@ -548,6 +550,8 @@ pub fn configure_extensions_dialog() -> Result<(), Box<dyn Error>> {
                     name: extension.clone(),
                     display_name: Some(display_name),
                     timeout: Some(timeout),
+                    max_pending_requests: Some(goose::config::DEFAULT_MAX_PENDING_REQUESTS),
+                    pending_request_timeout: Some(goose::config::DEFAULT_PENDING_REQUEST_TIMEOUT),
                     bundled: Some(true),
                 },
             })?;

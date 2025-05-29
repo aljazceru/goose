@@ -178,10 +178,17 @@ impl ExtensionManager {
                 envs,
                 env_keys,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 ..
             } => {
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
-                let transport = SseTransport::new(uri, all_envs);
+                let transport = SseTransport::new(
+                    uri,
+                    all_envs,
+                    *max_pending_requests,
+                    pending_request_timeout.map(Duration::from_secs),
+                );
                 let handle = transport.start().await?;
                 let service = McpService::with_timeout(
                     handle,
@@ -197,10 +204,18 @@ impl ExtensionManager {
                 envs,
                 env_keys,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 ..
             } => {
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name).await?;
-                let transport = StdioTransport::new(cmd, args.to_vec(), all_envs);
+                let transport = StdioTransport::new(
+                    cmd,
+                    args.to_vec(),
+                    all_envs,
+                    *max_pending_requests,
+                    pending_request_timeout.map(Duration::from_secs),
+                );
                 let handle = transport.start().await?;
                 let service = McpService::with_timeout(
                     handle,
@@ -214,6 +229,8 @@ impl ExtensionManager {
                 name,
                 display_name: _,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 bundled: _,
             } => {
                 let cmd = std::env::current_exe()
@@ -225,6 +242,8 @@ impl ExtensionManager {
                     &cmd,
                     vec!["mcp".to_string(), name.clone()],
                     HashMap::new(),
+                    *max_pending_requests,
+                    pending_request_timeout.map(Duration::from_secs),
                 );
                 let handle = transport.start().await?;
                 let service = McpService::with_timeout(

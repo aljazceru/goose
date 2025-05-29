@@ -7,6 +7,8 @@ use utoipa::ToSchema;
 
 pub const DEFAULT_EXTENSION: &str = "developer";
 pub const DEFAULT_EXTENSION_TIMEOUT: u64 = 300;
+pub const DEFAULT_MAX_PENDING_REQUESTS: usize = 128;
+pub const DEFAULT_PENDING_REQUEST_TIMEOUT: u64 = 30;
 pub const DEFAULT_EXTENSION_DESCRIPTION: &str = "";
 pub const DEFAULT_DISPLAY_NAME: &str = "Developer";
 
@@ -45,6 +47,8 @@ impl ExtensionConfigManager {
                             name: DEFAULT_EXTENSION.to_string(),
                             display_name: Some(DEFAULT_DISPLAY_NAME.to_string()),
                             timeout: Some(DEFAULT_EXTENSION_TIMEOUT),
+                            max_pending_requests: Some(DEFAULT_MAX_PENDING_REQUESTS),
+                            pending_request_timeout: Some(DEFAULT_PENDING_REQUEST_TIMEOUT),
                             bundled: Some(true),
                         },
                     },

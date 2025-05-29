@@ -18,17 +18,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let transport1 = StdioTransport::new("uvx", vec!["mcp-server-git".to_string()], HashMap::new());
+    let transport1 = StdioTransport::new(
+        "uvx",
+        vec!["mcp-server-git".to_string()],
+        HashMap::new(),
+        None,
+        None,
+    );
     let handle1 = transport1.start().await?;
     let service1 = McpService::with_timeout(handle1, Duration::from_secs(30));
     let client1 = McpClient::new(service1);
 
-    let transport2 = StdioTransport::new("uvx", vec!["mcp-server-git".to_string()], HashMap::new());
+    let transport2 = StdioTransport::new(
+        "uvx",
+        vec!["mcp-server-git".to_string()],
+        HashMap::new(),
+        None,
+        None,
+    );
     let handle2 = transport2.start().await?;
     let service2 = McpService::with_timeout(handle2, Duration::from_secs(30));
     let client2 = McpClient::new(service2);
 
-    let transport3 = SseTransport::new("http://localhost:8000/sse", HashMap::new());
+    let transport3 = SseTransport::new(
+        "http://localhost:8000/sse",
+        HashMap::new(),
+        None,
+        None,
+    );
     let handle3 = transport3.start().await?;
     let service3 = McpService::with_timeout(handle3, Duration::from_secs(10));
     let client3 = McpClient::new(service3);

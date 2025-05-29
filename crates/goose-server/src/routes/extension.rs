@@ -29,6 +29,10 @@ enum ExtensionConfigRequest {
         #[serde(default)]
         env_keys: Vec<String>,
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
     },
     /// Standard I/O (stdio) extension.
     #[serde(rename = "stdio")]
@@ -47,6 +51,10 @@ enum ExtensionConfigRequest {
         #[serde(default)]
         env_keys: Vec<String>,
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
     },
     /// Built-in extension that is part of the goose binary.
     #[serde(rename = "builtin")]
@@ -55,6 +63,10 @@ enum ExtensionConfigRequest {
         name: String,
         display_name: Option<String>,
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
     },
     /// Frontend extension that provides tools to be executed by the frontend.
     #[serde(rename = "frontend")]
@@ -167,6 +179,8 @@ async fn add_extension(
             envs,
             env_keys,
             timeout,
+            max_pending_requests,
+            pending_request_timeout,
         } => ExtensionConfig::Sse {
             name,
             uri,
@@ -174,6 +188,8 @@ async fn add_extension(
             env_keys,
             description: None,
             timeout,
+            max_pending_requests,
+            pending_request_timeout,
             bundled: None,
         },
         ExtensionConfigRequest::Stdio {
@@ -183,6 +199,8 @@ async fn add_extension(
             envs,
             env_keys,
             timeout,
+            max_pending_requests,
+            pending_request_timeout,
         } => {
             // TODO: We can uncomment once bugs are fixed. Check allowlist for Stdio extensions
             // if !is_command_allowed(&cmd, &args) {
@@ -204,6 +222,8 @@ async fn add_extension(
                 envs,
                 env_keys,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 bundled: None,
             }
         }
@@ -211,10 +231,14 @@ async fn add_extension(
             name,
             display_name,
             timeout,
+            max_pending_requests,
+            pending_request_timeout,
         } => ExtensionConfig::Builtin {
             name,
             display_name,
             timeout,
+            max_pending_requests,
+            pending_request_timeout,
             bundled: None,
         },
         ExtensionConfigRequest::Frontend {

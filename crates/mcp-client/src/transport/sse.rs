@@ -179,7 +179,14 @@ impl SseActor {
                 if let JsonRpcMessage::Request(JsonRpcRequest { id: Some(id), .. }) =
                     &transport_msg.message
                 {
-                    pending_requests.insert(id.to_string(), response_tx).await;
+                    pending_requests.cleanup().await;
+                    if let Err(e) = pending_requests
+                        .insert(id.to_string(), response_tx)
+                        .await
+                    {
+                        let _ = response_tx.send(Err(e));
+                        continue;
+                    }
                 }
             }
 
@@ -236,14 +243,23 @@ impl TransportHandle for SseTransportHandle {
 pub struct SseTransport {
     sse_url: String,
     env: HashMap<String, String>,
+    max_pending: Option<usize>,
+    pending_timeout: Option<Duration>,
 }
 
 /// The SSE transport spawns an `SseActor` on `start()`.
 impl SseTransport {
-    pub fn new<S: Into<String>>(sse_url: S, env: HashMap<String, String>) -> Self {
+    pub fn new<S: Into<String>>(
+        sse_url: S,
+        env: HashMap<String, String>,
+        max_pending: Option<usize>,
+        pending_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             sse_url: sse_url.into(),
             env,
+            max_pending,
+            pending_timeout,
         }
     }
 
@@ -286,7 +302,10 @@ impl Transport for SseTransport {
         // Build the actor
         let actor = SseActor::new(
             rx,
-            Arc::new(PendingRequests::new()),
+            Arc::new(PendingRequests::with_limits(
+                self.max_pending,
+                self.pending_timeout,
+            )),
             self.sse_url.clone(),
             post_endpoint,
         );

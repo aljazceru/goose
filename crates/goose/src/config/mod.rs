@@ -13,3 +13,5 @@ pub use extensions::DEFAULT_DISPLAY_NAME;
 pub use extensions::DEFAULT_EXTENSION;
 pub use extensions::DEFAULT_EXTENSION_DESCRIPTION;
 pub use extensions::DEFAULT_EXTENSION_TIMEOUT;
+pub use extensions::DEFAULT_MAX_PENDING_REQUESTS;
+pub use extensions::DEFAULT_PENDING_REQUEST_TIMEOUT;

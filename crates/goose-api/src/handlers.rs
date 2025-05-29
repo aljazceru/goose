@@ -72,6 +72,10 @@ pub enum ExtensionConfigRequest {
         #[serde(default)]
         env_keys: Vec<String>,
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
     },
     #[serde(rename = "stdio")]
     Stdio {
@@ -84,12 +88,20 @@ pub enum ExtensionConfigRequest {
         #[serde(default)]
         env_keys: Vec<String>,
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
     },
     #[serde(rename = "builtin")]
     Builtin {
         name: String,
         display_name: Option<String>,
         timeout: Option<u64>,
+        #[serde(default)]
+        max_pending_requests: Option<usize>,
+        #[serde(default)]
+        pending_request_timeout: Option<u64>,
     },
     #[serde(rename = "frontend")]
     Frontend {
@@ -370,7 +382,15 @@ pub async fn add_extension_handler(
     }
 
     let extension = match req {
-        ExtensionConfigRequest::Sse { name, uri, envs, env_keys, timeout } => {
+        ExtensionConfigRequest::Sse {
+            name,
+            uri,
+            envs,
+            env_keys,
+            timeout,
+            max_pending_requests,
+            pending_request_timeout,
+        } => {
             ExtensionConfig::Sse {
                 name,
                 uri,
@@ -378,10 +398,21 @@ pub async fn add_extension_handler(
                 env_keys,
                 description: None,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 bundled: None,
             }
         }
-        ExtensionConfigRequest::Stdio { name, cmd, args, envs, env_keys, timeout } => {
+        ExtensionConfigRequest::Stdio {
+            name,
+            cmd,
+            args,
+            envs,
+            env_keys,
+            timeout,
+            max_pending_requests,
+            pending_request_timeout,
+        } => {
             ExtensionConfig::Stdio {
                 name,
                 cmd,
@@ -389,15 +420,25 @@ pub async fn add_extension_handler(
                 envs,
                 env_keys,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 description: None,
                 bundled: None,
             }
         }
-        ExtensionConfigRequest::Builtin { name, display_name, timeout } => {
+        ExtensionConfigRequest::Builtin {
+            name,
+            display_name,
+            timeout,
+            max_pending_requests,
+            pending_request_timeout,
+        } => {
             ExtensionConfig::Builtin {
                 name,
                 display_name,
                 timeout,
+                max_pending_requests,
+                pending_request_timeout,
                 bundled: None,
             }
         }

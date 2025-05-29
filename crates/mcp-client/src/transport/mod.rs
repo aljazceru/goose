@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use mcp_core::protocol::JsonRpcMessage;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -31,6 +32,9 @@ pub enum Error {
 
     #[error("HTTP error: {status} - {message}")]
     HttpError { status: u16, message: String },
+
+    #[error("Too many pending requests")]
+    PendingRequestsFull,
 }
 
 /// A message that can be sent through the transport
@@ -89,7 +93,10 @@ pub async fn send_message(
 
 // A data structure to store pending requests and their response channels
 pub struct PendingRequests {
-    requests: RwLock<HashMap<String, oneshot::Sender<Result<JsonRpcMessage, Error>>>>,
+    requests:
+        RwLock<HashMap<String, (oneshot::Sender<Result<JsonRpcMessage, Error>>, Instant)>>,
+    max_size: Option<usize>,
+    timeout: Option<Duration>,
 }
 
 impl Default for PendingRequests {
@@ -100,18 +107,46 @@ impl Default for PendingRequests {
 
 impl PendingRequests {
     pub fn new() -> Self {
+        Self::with_limits(None, None)
+    }
+
+    pub fn with_limits(max_size: Option<usize>, timeout: Option<Duration>) -> Self {
         Self {
             requests: RwLock::new(HashMap::new()),
+            max_size,
+            timeout,
         }
     }
 
-    pub async fn insert(&self, id: String, sender: oneshot::Sender<Result<JsonRpcMessage, Error>>) {
-        self.requests.write().await.insert(id, sender);
+    pub async fn insert(
+        &self,
+        id: String,
+        sender: oneshot::Sender<Result<JsonRpcMessage, Error>>,
+    ) -> Result<(), Error> {
+        self.cleanup().await;
+        let mut map = self.requests.write().await;
+        if let Some(max) = self.max_size {
+            if map.len() >= max {
+                return Err(Error::PendingRequestsFull);
+            }
+        }
+        map.insert(id, (sender, Instant::now()));
+        Ok(())
     }
 
     pub async fn respond(&self, id: &str, response: Result<JsonRpcMessage, Error>) {
-        if let Some(tx) = self.requests.write().await.remove(id) {
+        if let Some((tx, _)) = self.requests.write().await.remove(id) {
             let _ = tx.send(response);
+        }
+    }
+
+    pub async fn cleanup(&self) {
+        if let Some(timeout) = self.timeout {
+            let now = Instant::now();
+            self.requests
+                .write()
+                .await
+                .retain(|_, (_, ts)| now.duration_since(*ts) <= timeout);
         }
     }
 

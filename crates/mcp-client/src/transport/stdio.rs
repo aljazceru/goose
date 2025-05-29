@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -162,7 +163,14 @@ impl StdioActor {
             if let Some(response_tx) = transport_msg.response_tx.take() {
                 if let JsonRpcMessage::Request(request) = &transport_msg.message {
                     if let Some(id) = &request.id {
-                        pending_requests.insert(id.to_string(), response_tx).await;
+                        pending_requests.cleanup().await;
+                        if let Err(e) = pending_requests
+                            .insert(id.to_string(), response_tx)
+                            .await
+                        {
+                            let _ = response_tx.send(Err(e));
+                            continue;
+                        }
                     }
                 }
             }
@@ -218,6 +226,8 @@ pub struct StdioTransport {
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
+    max_pending: Option<usize>,
+    pending_timeout: Option<Duration>,
 }
 
 impl StdioTransport {
@@ -225,11 +235,15 @@ impl StdioTransport {
         command: S,
         args: Vec<String>,
         env: HashMap<String, String>,
+        max_pending: Option<usize>,
+        pending_timeout: Option<Duration>,
     ) -> Self {
         Self {
             command: command.into(),
             args,
             env,
+            max_pending,
+            pending_timeout,
         }
     }
 
@@ -294,7 +308,10 @@ impl Transport for StdioTransport {
 
         let actor = StdioActor {
             receiver: Some(message_rx),
-            pending_requests: Arc::new(PendingRequests::new()),
+            pending_requests: Arc::new(PendingRequests::with_limits(
+                self.max_pending,
+                self.pending_timeout,
+            )),
             process,
             error_sender: error_tx,
             stdin: Some(stdin),

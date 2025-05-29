@@ -177,6 +177,8 @@ impl Session {
             description: Some(goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string()),
             // TODO: should set timeout
             timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+            max_pending_requests: Some(goose::config::DEFAULT_MAX_PENDING_REQUESTS),
+            pending_request_timeout: Some(goose::config::DEFAULT_PENDING_REQUEST_TIMEOUT),
             bundled: None,
         };
 
@@ -210,6 +212,8 @@ impl Session {
             description: Some(goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string()),
             // TODO: should set timeout
             timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+            max_pending_requests: Some(goose::config::DEFAULT_MAX_PENDING_REQUESTS),
+            pending_request_timeout: Some(goose::config::DEFAULT_PENDING_REQUEST_TIMEOUT),
             bundled: None,
         };
 
@@ -235,6 +239,8 @@ impl Session {
                 display_name: None,
                 // TODO: should set a timeout
                 timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
+                max_pending_requests: Some(goose::config::DEFAULT_MAX_PENDING_REQUESTS),
+                pending_request_timeout: Some(goose::config::DEFAULT_PENDING_REQUEST_TIMEOUT),
                 bundled: None,
             };
             self.agent
