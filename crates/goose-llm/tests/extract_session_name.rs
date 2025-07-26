@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use goose_llm::extractors::generate_session_name;
 use goose_llm::message::Message;
 use goose_llm::providers::errors::ProviderError;
@@ -22,7 +22,7 @@ async fn _generate_session_name(messages: &[Message]) -> Result<String, Provider
         "token": std::env::var("DATABRICKS_TOKEN").expect("Missing DATABRICKS_TOKEN"),
     });
 
-    generate_session_name(provider_name, provider_config, messages).await
+    generate_session_name(provider_name, provider_config, messages, None).await
 }
 
 #[tokio::test]
@@ -35,8 +35,8 @@ async fn test_generate_session_name_success() {
     // Build a few messages with at least two user messages
     let messages = vec![
         Message::user().with_text("Hello, how are you?"),
-        Message::assistant().with_text("I’m fine, thanks!"),
-        Message::user().with_text("What’s the weather in New York tomorrow?"),
+        Message::assistant().with_text("I'm fine, thanks!"),
+        Message::user().with_text("What's the weather in New York tomorrow?"),
     ];
 
     let name = _generate_session_name(&messages)

@@ -1,17 +1,23 @@
 import Electron, { contextBridge, ipcRenderer, webUtils } from 'electron';
-
-interface RecipeConfig {
-  id: string;
-  name: string;
-  description: string;
-  instructions?: string;
-  activities?: string[];
-  [key: string]: unknown;
-}
+import { Recipe } from './recipe';
 
 interface NotificationData {
   title: string;
   body: string;
+}
+
+interface MessageBoxOptions {
+  type?: 'none' | 'info' | 'error' | 'question' | 'warning';
+  buttons?: string[];
+  defaultId?: number;
+  title?: string;
+  message: string;
+  detail?: string;
+}
+
+interface MessageBoxResponse {
+  response: number;
+  checkboxChecked?: boolean;
 }
 
 interface FileResponse {
@@ -29,6 +35,11 @@ interface SaveDataUrlResponse {
 
 const config = JSON.parse(process.argv.find((arg) => arg.startsWith('{')) || '{}');
 
+interface UpdaterEvent {
+  event: string;
+  data?: unknown;
+}
+
 // Define the API types in a single place
 type ElectronAPI = {
   platform: string;
@@ -41,11 +52,12 @@ type ElectronAPI = {
     dir?: string,
     version?: string,
     resumeSessionId?: string,
-    recipeConfig?: RecipeConfig,
+    recipe?: Recipe,
     viewType?: string
   ) => void;
   logInfo: (txt: string) => void;
   showNotification: (data: NotificationData) => void;
+  showMessageBox: (options: MessageBoxOptions) => Promise<MessageBoxResponse>;
   openInChrome: (url: string) => void;
   fetchMetadata: (url: string) => Promise<string>;
   reloadApp: () => void;
@@ -56,12 +68,21 @@ type ElectronAPI = {
   getBinaryPath: (binaryName: string) => Promise<string>;
   readFile: (directory: string) => Promise<FileResponse>;
   writeFile: (directory: string, content: string) => Promise<boolean>;
+  ensureDirectory: (dirPath: string) => Promise<boolean>;
+  listFiles: (dirPath: string, extension?: string) => Promise<string[]>;
   getAllowedExtensions: () => Promise<string[]>;
   getPathForFile: (file: File) => string;
   setMenuBarIcon: (show: boolean) => Promise<boolean>;
   getMenuBarIconState: () => Promise<boolean>;
   setDockIcon: (show: boolean) => Promise<boolean>;
   getDockIconState: () => Promise<boolean>;
+  getSettings: () => Promise<unknown | null>;
+  setSchedulingEngine: (engine: string) => Promise<boolean>;
+  setQuitConfirmation: (show: boolean) => Promise<boolean>;
+  getQuitConfirmationState: () => Promise<boolean>;
+  setWakelock: (enable: boolean) => Promise<boolean>;
+  getWakelockState: () => Promise<boolean>;
+  openNotificationsSettings: () => Promise<boolean>;
   on: (
     channel: string,
     callback: (event: Electron.IpcRendererEvent, ...args: unknown[]) => void
@@ -76,6 +97,18 @@ type ElectronAPI = {
   deleteTempFile: (filePath: string) => void;
   // Function to serve temp images
   getTempImage: (filePath: string) => Promise<string | null>;
+  // Update-related functions
+  getVersion: () => string;
+  checkForUpdates: () => Promise<{ updateInfo: unknown; error: string | null }>;
+  downloadUpdate: () => Promise<{ success: boolean; error: string | null }>;
+  installUpdate: () => void;
+  restartApp: () => void;
+  onUpdaterEvent: (callback: (event: UpdaterEvent) => void) => void;
+  getUpdateState: () => Promise<{ updateAvailable: boolean; latestVersion?: string } | null>;
+  // Recipe warning functions
+  closeWindow: () => void;
+  hasAcceptedRecipeBefore: (recipeConfig: Recipe) => Promise<boolean>;
+  recordRecipeHash: (recipeConfig: Recipe) => Promise<boolean>;
 };
 
 type AppConfigAPI = {
@@ -86,7 +119,20 @@ type AppConfigAPI = {
 const electronAPI: ElectronAPI = {
   platform: process.platform,
   reactReady: () => ipcRenderer.send('react-ready'),
-  getConfig: () => config,
+  getConfig: () => {
+    // Add fallback to localStorage if config from preload is empty or missing
+    if (!config || Object.keys(config).length === 0) {
+      try {
+        const storedConfig = localStorage.getItem('gooseConfig');
+        if (storedConfig) {
+          return JSON.parse(storedConfig);
+        }
+      } catch (e) {
+        console.warn('Failed to parse stored config from localStorage:', e);
+      }
+    }
+    return config;
+  },
   hideWindow: () => ipcRenderer.send('hide-window'),
   directoryChooser: (replace?: boolean) => ipcRenderer.invoke('directory-chooser', replace),
   createChatWindow: (
@@ -94,20 +140,13 @@ const electronAPI: ElectronAPI = {
     dir?: string,
     version?: string,
     resumeSessionId?: string,
-    recipeConfig?: RecipeConfig,
+    recipe?: Recipe,
     viewType?: string
   ) =>
-    ipcRenderer.send(
-      'create-chat-window',
-      query,
-      dir,
-      version,
-      resumeSessionId,
-      recipeConfig,
-      viewType
-    ),
+    ipcRenderer.send('create-chat-window', query, dir, version, resumeSessionId, recipe, viewType),
   logInfo: (txt: string) => ipcRenderer.send('logInfo', txt),
   showNotification: (data: NotificationData) => ipcRenderer.send('notify', data),
+  showMessageBox: (options: MessageBoxOptions) => ipcRenderer.invoke('show-message-box', options),
   openInChrome: (url: string) => ipcRenderer.send('open-in-chrome', url),
   fetchMetadata: (url: string) => ipcRenderer.invoke('fetch-metadata', url),
   reloadApp: () => ipcRenderer.send('reload-app'),
@@ -119,12 +158,22 @@ const electronAPI: ElectronAPI = {
   readFile: (filePath: string) => ipcRenderer.invoke('read-file', filePath),
   writeFile: (filePath: string, content: string) =>
     ipcRenderer.invoke('write-file', filePath, content),
+  ensureDirectory: (dirPath: string) => ipcRenderer.invoke('ensure-directory', dirPath),
+  listFiles: (dirPath: string, extension?: string) =>
+    ipcRenderer.invoke('list-files', dirPath, extension),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getAllowedExtensions: () => ipcRenderer.invoke('get-allowed-extensions'),
   setMenuBarIcon: (show: boolean) => ipcRenderer.invoke('set-menu-bar-icon', show),
   getMenuBarIconState: () => ipcRenderer.invoke('get-menu-bar-icon-state'),
   setDockIcon: (show: boolean) => ipcRenderer.invoke('set-dock-icon', show),
   getDockIconState: () => ipcRenderer.invoke('get-dock-icon-state'),
+  getSettings: () => ipcRenderer.invoke('get-settings'),
+  setSchedulingEngine: (engine: string) => ipcRenderer.invoke('set-scheduling-engine', engine),
+  setQuitConfirmation: (show: boolean) => ipcRenderer.invoke('set-quit-confirmation', show),
+  getQuitConfirmationState: () => ipcRenderer.invoke('get-quit-confirmation-state'),
+  setWakelock: (enable: boolean) => ipcRenderer.invoke('set-wakelock', enable),
+  getWakelockState: () => ipcRenderer.invoke('get-wakelock-state'),
+  openNotificationsSettings: () => ipcRenderer.invoke('open-notifications-settings'),
   on: (
     channel: string,
     callback: (event: Electron.IpcRendererEvent, ...args: unknown[]) => void
@@ -149,6 +198,32 @@ const electronAPI: ElectronAPI = {
   getTempImage: (filePath: string): Promise<string | null> => {
     return ipcRenderer.invoke('get-temp-image', filePath);
   },
+  getVersion: (): string => {
+    return config.GOOSE_VERSION || ipcRenderer.sendSync('get-app-version') || '';
+  },
+  checkForUpdates: (): Promise<{ updateInfo: unknown; error: string | null }> => {
+    return ipcRenderer.invoke('check-for-updates');
+  },
+  downloadUpdate: (): Promise<{ success: boolean; error: string | null }> => {
+    return ipcRenderer.invoke('download-update');
+  },
+  installUpdate: (): void => {
+    ipcRenderer.invoke('install-update');
+  },
+  restartApp: (): void => {
+    ipcRenderer.send('restart-app');
+  },
+  onUpdaterEvent: (callback: (event: UpdaterEvent) => void): void => {
+    ipcRenderer.on('updater-event', (_event, data) => callback(data));
+  },
+  getUpdateState: (): Promise<{ updateAvailable: boolean; latestVersion?: string } | null> => {
+    return ipcRenderer.invoke('get-update-state');
+  },
+  closeWindow: () => ipcRenderer.send('close-window'),
+  hasAcceptedRecipeBefore: (recipeConfig: Recipe) =>
+    ipcRenderer.invoke('has-accepted-recipe-before', recipeConfig),
+  recordRecipeHash: (recipeConfig: Recipe) =>
+    ipcRenderer.invoke('record-recipe-hash', recipeConfig),
 };
 
 const appConfigAPI: AppConfigAPI = {

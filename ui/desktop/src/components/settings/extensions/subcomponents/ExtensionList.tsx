@@ -19,9 +19,14 @@ export default function ExtensionList({
   isStatic,
   disableConfiguration: _disableConfiguration,
 }: ExtensionListProps) {
+  // Sort extensions alphabetically by their friendly title
+  const sortedExtensions = [...extensions].sort((a, b) =>
+    getFriendlyTitle(a).localeCompare(getFriendlyTitle(b))
+  );
+
   return (
-    <div className="grid grid-cols-2 gap-2 mb-2">
-      {extensions.map((extension) => (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-2">
+      {sortedExtensions.map((extension) => (
         <ExtensionItem
           key={extension.name}
           extension={extension}
@@ -89,6 +94,14 @@ export function getSubtitle(config: ExtensionConfig): SubtitleParts {
     const description = config.description
       ? `SSE extension: ${config.description}`
       : 'SSE extension';
+    const command = config.uri || null;
+    return { description, command };
+  }
+
+  if (config.type === 'streamable_http') {
+    const description = config.description
+      ? `Streamable HTTP extension: ${config.description}`
+      : 'Streamable HTTP extension';
     const command = config.uri || null;
     return { description, command };
   }

@@ -7,11 +7,15 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["lib", "cdylib"]
 name = "goose_llm"
 
 [dependencies]
+goose = { path = "../goose" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -46,7 +50,7 @@ tokio = { version = "1.43", features = ["time", "sync"] }
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.15.0"
-dotenv = "0.15"
+dotenvy = "0.15.7"
 lazy_static = "1.5"
 ctor = "0.2.7"
 tokio = { version = "1.43", features = ["full"] }
@@ -59,3 +63,11 @@ path = "uniffi-bindgen.rs"
 [[example]]
 name = "simple"
 path = "examples/simple.rs"
+
+[[example]]
+name = "image"
+path = "examples/image.rs"
+
+[[example]]
+name = "prompt_override"
+path = "examples/prompt_override.rs"

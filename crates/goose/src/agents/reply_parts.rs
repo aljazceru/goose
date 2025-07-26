@@ -2,19 +2,35 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_stream::try_stream;
+use futures::stream::StreamExt;
+
 use crate::agents::router_tool_selector::RouterToolSelectionStrategy;
 use crate::config::Config;
 use crate::message::{Message, MessageContent, ToolRequest};
-use crate::providers::base::{Provider, ProviderUsage};
+use crate::providers::base::{stream_from_single_message, MessageStream, Provider, ProviderUsage};
 use crate::providers::errors::ProviderError;
 use crate::providers::toolshim::{
     augment_message_with_tool_calls, convert_tool_messages_to_text,
     modify_system_prompt_for_tool_json, OllamaInterpreter,
 };
 use crate::session;
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 
 use super::super::agents::Agent;
+
+async fn toolshim_postprocess(
+    response: Message,
+    toolshim_tools: &[Tool],
+) -> Result<Message, ProviderError> {
+    let interpreter = OllamaInterpreter::new().map_err(|e| {
+        ProviderError::ExecutionError(format!("Failed to create OllamaInterpreter: {}", e))
+    })?;
+
+    augment_message_with_tool_calls(&interpreter, response, toolshim_tools)
+        .await
+        .map_err(|e| ProviderError::ExecutionError(format!("Failed to augment message: {}", e)))
+}
 
 impl Agent {
     /// Prepares tools and system prompt for a provider request
@@ -29,6 +45,7 @@ impl Agent {
 
         let tool_selection_strategy = match router_tool_selection_strategy.to_lowercase().as_str() {
             "vector" => Some(RouterToolSelectionStrategy::Vector),
+            "llm" => Some(RouterToolSelectionStrategy::Llm),
             _ => None,
         };
 
@@ -36,6 +53,10 @@ impl Agent {
         let mut tools = match tool_selection_strategy {
             Some(RouterToolSelectionStrategy::Vector) => {
                 self.list_tools_for_router(Some(RouterToolSelectionStrategy::Vector))
+                    .await
+            }
+            Some(RouterToolSelectionStrategy::Llm) => {
+                self.list_tools_for_router(Some(RouterToolSelectionStrategy::Llm))
                     .await
             }
             _ => self.list_tools(None).await,
@@ -47,7 +68,7 @@ impl Agent {
         }
 
         // Prepare system prompt
-        let extension_manager = self.extension_manager.lock().await;
+        let extension_manager = self.extension_manager.read().await;
         let extensions_info = extension_manager.get_extensions_info().await;
 
         // Get model name from provider
@@ -89,11 +110,11 @@ impl Agent {
             .iter()
             .fold((HashSet::new(), HashSet::new()), |mut acc, tool| {
                 match &tool.annotations {
-                    Some(annotations) if annotations.read_only_hint => {
-                        acc.0.insert(tool.name.clone());
+                    Some(annotations) if annotations.read_only_hint.unwrap_or(false) => {
+                        acc.0.insert(tool.name.to_string());
                     }
                     _ => {
-                        acc.1.insert(tool.name.clone());
+                        acc.1.insert(tool.name.to_string());
                     }
                 }
                 acc
@@ -123,23 +144,65 @@ impl Agent {
             .complete(system_prompt, &messages_for_provider, tools)
             .await?;
 
-        // Store the model information in the global store
         crate::providers::base::set_current_model(&usage.model);
 
-        // Post-process / structure the response only if tool interpretation is enabled
         if config.toolshim {
-            let interpreter = OllamaInterpreter::new().map_err(|e| {
-                ProviderError::ExecutionError(format!("Failed to create OllamaInterpreter: {}", e))
-            })?;
-
-            response = augment_message_with_tool_calls(&interpreter, response, toolshim_tools)
-                .await
-                .map_err(|e| {
-                    ProviderError::ExecutionError(format!("Failed to augment message: {}", e))
-                })?;
+            response = toolshim_postprocess(response, toolshim_tools).await?;
         }
 
         Ok((response, usage))
+    }
+
+    /// Stream a response from the LLM provider.
+    /// Handles toolshim transformations if needed
+    pub(crate) async fn stream_response_from_provider(
+        provider: Arc<dyn Provider>,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[Tool],
+        toolshim_tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        let config = provider.get_model_config();
+
+        // Convert tool messages to text if toolshim is enabled
+        let messages_for_provider = if config.toolshim {
+            convert_tool_messages_to_text(messages)
+        } else {
+            messages.to_vec()
+        };
+
+        // Clone owned data to move into the async stream
+        let system_prompt = system_prompt.to_owned();
+        let tools = tools.to_owned();
+        let toolshim_tools = toolshim_tools.to_owned();
+        let provider = provider.clone();
+
+        let mut stream = if provider.supports_streaming() {
+            provider
+                .stream(system_prompt.as_str(), &messages_for_provider, &tools)
+                .await?
+        } else {
+            let (message, usage) = provider
+                .complete(system_prompt.as_str(), &messages_for_provider, &tools)
+                .await?;
+            stream_from_single_message(message, usage)
+        };
+
+        Ok(Box::pin(try_stream! {
+            while let Some(Ok((mut message, usage))) = stream.next().await {
+                // Store the model information in the global store
+                if let Some(usage) = usage.as_ref() {
+                    crate::providers::base::set_current_model(&usage.model);
+                }
+
+                // Post-process / structure the response only if tool interpretation is enabled
+                if message.is_some() && config.toolshim {
+                    message = Some(toolshim_postprocess(message.unwrap(), &toolshim_tools).await?);
+                }
+
+                yield (message, usage);
+            }
+        }))
     }
 
     /// Categorize tool requests from the response into different types
@@ -186,6 +249,7 @@ impl Agent {
         }
 
         let filtered_message = Message {
+            id: response.id.clone(),
             role: response.role.clone(),
             created: response.created,
             content: filtered_content,
@@ -211,13 +275,17 @@ impl Agent {
         (frontend_requests, other_requests, filtered_message)
     }
 
-    /// Update session metrics after a response
     pub(crate) async fn update_session_metrics(
-        session_config: crate::agents::types::SessionConfig,
-        usage: &crate::providers::base::ProviderUsage,
+        session_config: &crate::agents::types::SessionConfig,
+        usage: &ProviderUsage,
         messages_length: usize,
     ) -> Result<()> {
-        let session_file_path = session::storage::get_path(session_config.id.clone());
+        let session_file_path = match session::storage::get_path(session_config.id.clone()) {
+            Ok(path) => path,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to get session file path: {}", e));
+            }
+        };
         let mut metadata = session::storage::read_metadata(&session_file_path)?;
 
         metadata.schedule_id = session_config.schedule_id.clone();

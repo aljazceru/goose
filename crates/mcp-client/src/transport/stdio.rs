@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use async_trait::async_trait;
-use mcp_core::protocol::JsonRpcMessage;
+use rmcp::model::JsonRpcMessage;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 
@@ -13,6 +13,8 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
 use nix::unistd::{getpgid, Pid};
 
+use crate::transport::TransportMessageRecv;
+
 use super::{serialize_and_send, Error, Transport, TransportHandle};
 
 /// A `StdioTransport` uses a child process's stdin/stdout as a communication channel.
@@ -20,7 +22,7 @@ use super::{serialize_and_send, Error, Transport, TransportHandle};
 /// It uses channels for message passing and handles responses asynchronously through a background task.
 pub struct StdioActor {
     receiver: Option<mpsc::Receiver<String>>,
-    sender: Option<mpsc::Sender<JsonRpcMessage>>,
+    sender: Option<mpsc::Sender<TransportMessageRecv>>,
     process: Child, // we store the process to keep it alive
     error_sender: mpsc::Sender<Error>,
     stdin: Option<ChildStdin>,
@@ -94,7 +96,7 @@ impl StdioActor {
         }
     }
 
-    async fn handle_proc_output(stdout: ChildStdout, sender: mpsc::Sender<JsonRpcMessage>) {
+    async fn handle_proc_output(stdout: ChildStdout, sender: mpsc::Sender<TransportMessageRecv>) {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         loop {
@@ -104,7 +106,7 @@ impl StdioActor {
                     break;
                 } // EOF
                 Ok(_) => {
-                    if let Ok(message) = serde_json::from_str::<JsonRpcMessage>(&line) {
+                    if let Ok(message) = serde_json::from_str::<TransportMessageRecv>(&line) {
                         tracing::debug!(
                             message = ?message,
                             "Received incoming message"
@@ -130,10 +132,7 @@ impl StdioActor {
         while let Some(message_str) = receiver.recv().await {
             tracing::debug!(message = ?message_str, "Sending outgoing message");
 
-            if let Err(e) = stdin
-                .write_all(format!("{}\n", message_str).as_bytes())
-                .await
-            {
+            if let Err(e) = stdin.write_all(format!("{message_str}\n").as_bytes()).await {
                 tracing::error!(error = ?e, "Error writing message to child process");
                 break;
             }
@@ -148,8 +147,8 @@ impl StdioActor {
 
 #[derive(Clone)]
 pub struct StdioTransportHandle {
-    sender: mpsc::Sender<String>,                         // to process
-    receiver: Arc<Mutex<mpsc::Receiver<JsonRpcMessage>>>, // from process
+    sender: mpsc::Sender<String>,                               // to process
+    receiver: Arc<Mutex<mpsc::Receiver<TransportMessageRecv>>>, // from process
     error_receiver: Arc<Mutex<mpsc::Receiver<Error>>>,
 }
 
@@ -162,9 +161,15 @@ impl TransportHandle for StdioTransportHandle {
         result
     }
 
-    async fn receive(&self) -> Result<JsonRpcMessage, Error> {
+    async fn receive(&self) -> Result<TransportMessageRecv, Error> {
         let mut receiver = self.receiver.lock().await;
-        receiver.recv().await.ok_or(Error::ChannelClosed)
+        match receiver.recv().await {
+            Some(message) => Ok(message),
+            None => {
+                self.check_for_errors().await?;
+                Err(Error::ChannelClosed)
+            }
+        }
     }
 }
 
@@ -218,9 +223,22 @@ impl StdioTransport {
         #[cfg(windows)]
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW flag
 
-        let mut process = command
-            .spawn()
-            .map_err(|e| Error::StdioProcessError(e.to_string()))?;
+        let mut process = command.spawn().map_err(|e| {
+            let command = command.into_std();
+            Error::StdioProcessError(format!(
+                "Could not run extension command (`{} {}`): {}",
+                command
+                    .get_program()
+                    .to_str()
+                    .unwrap_or("[invalid command]"),
+                command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap_or("[invalid arg]"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                e
+            ))
+        })?;
 
         let stdin = process
             .stdin

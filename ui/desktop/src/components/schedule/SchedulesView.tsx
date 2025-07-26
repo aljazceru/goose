@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   listSchedules,
   createSchedule,
@@ -10,24 +10,206 @@ import {
   inspectRunningJob,
   ScheduledJob,
 } from '../../schedule';
-import BackButton from '../ui/BackButton';
 import { ScrollArea } from '../ui/scroll-area';
-import MoreMenuLayout from '../more_menu/MoreMenuLayout';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { TrashIcon } from '../icons/TrashIcon';
-import { Plus, RefreshCw, Pause, Play, Edit, Square, Eye } from 'lucide-react';
+import { Plus, RefreshCw, Pause, Play, Edit, Square, Eye, CircleDotDashed } from 'lucide-react';
 import { CreateScheduleModal, NewSchedulePayload } from './CreateScheduleModal';
 import { EditScheduleModal } from './EditScheduleModal';
 import ScheduleDetailView from './ScheduleDetailView';
 import { toastError, toastSuccess } from '../../toasts';
 import cronstrue from 'cronstrue';
+import { formatToLocalDateWithTimezone } from '../../utils/date';
+import { MainPanelLayout } from '../Layout/MainPanelLayout';
 
 interface SchedulesViewProps {
-  onClose: () => void;
+  onClose?: () => void;
 }
 
-const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
+// Memoized ScheduleCard component to prevent unnecessary re-renders
+const ScheduleCard = React.memo<{
+  job: ScheduledJob;
+  onNavigateToDetail: (id: string) => void;
+  onEdit: (job: ScheduledJob) => void;
+  onPause: (id: string) => void;
+  onUnpause: (id: string) => void;
+  onKill: (id: string) => void;
+  onInspect: (id: string) => void;
+  onDelete: (id: string) => void;
+  isPausing: boolean;
+  isDeleting: boolean;
+  isKilling: boolean;
+  isInspecting: boolean;
+  isSubmitting: boolean;
+}>(
+  ({
+    job,
+    onNavigateToDetail,
+    onEdit,
+    onPause,
+    onUnpause,
+    onKill,
+    onInspect,
+    onDelete,
+    isPausing,
+    isDeleting,
+    isKilling,
+    isInspecting,
+    isSubmitting,
+  }) => {
+    const readableCron = useMemo(() => {
+      try {
+        return cronstrue.toString(job.cron);
+      } catch (e) {
+        console.warn(`Could not parse cron string "${job.cron}":`, e);
+        return job.cron;
+      }
+    }, [job.cron]);
+
+    const formattedLastRun = useMemo(() => {
+      return formatToLocalDateWithTimezone(job.last_run);
+    }, [job.last_run]);
+
+    return (
+      <Card
+        className="py-2 px-4 mb-2 bg-background-default border-none hover:bg-background-muted cursor-pointer transition-all duration-150"
+        onClick={() => onNavigateToDetail(job.id)}
+      >
+        <div className="flex justify-between items-start gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <h3 className="text-base truncate max-w-[50vw]" title={job.id}>
+                {job.id}
+              </h3>
+              {job.execution_mode && (
+                <span
+                  className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                    job.execution_mode === 'foreground'
+                      ? 'bg-background-accent text-text-on-accent'
+                      : 'bg-background-medium text-text-default'
+                  }`}
+                >
+                  {job.execution_mode === 'foreground' ? '🖥️' : '⚡'}
+                </span>
+              )}
+              {job.currently_running && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
+                  <span className="inline-block w-2 h-2 bg-green-500 rounded-full mr-1 animate-pulse"></span>
+                  Running
+                </span>
+              )}
+              {job.paused && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300">
+                  <Pause className="w-3 h-3 mr-1" />
+                  Paused
+                </span>
+              )}
+            </div>
+            <p className="text-text-muted text-sm mb-2 line-clamp-2" title={readableCron}>
+              {readableCron}
+            </p>
+            <div className="flex items-center text-xs text-text-muted">
+              <span>Last run: {formattedLastRun}</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            {!job.currently_running && (
+              <>
+                <Button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEdit(job);
+                  }}
+                  disabled={isPausing || isDeleting || isSubmitting}
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                >
+                  <Edit className="w-4 h-4 mr-1" />
+                  Edit
+                </Button>
+                <Button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (job.paused) {
+                      onUnpause(job.id);
+                    } else {
+                      onPause(job.id);
+                    }
+                  }}
+                  disabled={isPausing || isDeleting}
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                >
+                  {job.paused ? (
+                    <>
+                      <Play className="w-4 h-4 mr-1" />
+                      Resume
+                    </>
+                  ) : (
+                    <>
+                      <Pause className="w-4 h-4 mr-1" />
+                      Pause
+                    </>
+                  )}
+                </Button>
+              </>
+            )}
+            {job.currently_running && (
+              <>
+                <Button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onInspect(job.id);
+                  }}
+                  disabled={isInspecting || isKilling}
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                >
+                  <Eye className="w-4 h-4 mr-1" />
+                  Inspect
+                </Button>
+                <Button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onKill(job.id);
+                  }}
+                  disabled={isKilling || isInspecting}
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                >
+                  <Square className="w-4 h-4 mr-1" />
+                  Kill
+                </Button>
+              </>
+            )}
+            <Button
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(job.id);
+              }}
+              disabled={isPausing || isDeleting || isKilling || isInspecting}
+              variant="ghost"
+              size="sm"
+              className="h-8 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+            >
+              <TrashIcon className="w-4 h-4" />
+            </Button>
+          </div>
+        </div>
+      </Card>
+    );
+  }
+);
+
+ScheduleCard.displayName = 'ScheduleCard';
+
+const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose: _onClose }) => {
   const [schedules, setSchedules] = useState<ScheduledJob[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -46,12 +228,19 @@ const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
 
   const [viewingScheduleId, setViewingScheduleId] = useState<string | null>(null);
 
-  const fetchSchedules = async () => {
-    setIsLoading(true);
+  // Memoized fetch function to prevent unnecessary re-creation
+  const fetchSchedules = useCallback(async (isRefresh = false) => {
+    if (!isRefresh) setIsLoading(true);
     setApiError(null);
     try {
       const fetchedSchedules = await listSchedules();
-      setSchedules(fetchedSchedules);
+      setSchedules((prevSchedules) => {
+        // Only update if schedules actually changed to prevent unnecessary re-renders
+        if (JSON.stringify(prevSchedules) !== JSON.stringify(fetchedSchedules)) {
+          return fetchedSchedules;
+        }
+        return prevSchedules;
+      });
     } catch (error) {
       console.error('Failed to fetch schedules:', error);
       setApiError(
@@ -60,14 +249,14 @@ const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
           : 'An unknown error occurred while fetching schedules.'
       );
     } finally {
-      setIsLoading(false);
+      if (!isRefresh) setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     if (viewingScheduleId === null) {
       fetchSchedules();
-      
+
       // Check for pending deep link from recipe editor
       const pendingDeepLink = localStorage.getItem('pendingScheduleDeepLink');
       if (pendingDeepLink) {
@@ -76,38 +265,57 @@ const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
         // The CreateScheduleModal will handle the deep link
       }
     }
-  }, [viewingScheduleId]);
+  }, [viewingScheduleId, fetchSchedules]);
 
-  // Add a periodic refresh for schedules list to keep the running status up to date
+  // Optimized periodic refresh - only refresh if not actively doing something
   useEffect(() => {
     if (viewingScheduleId !== null) return;
 
-    // Set up periodic refresh every 10 seconds
+    // Set up periodic refresh every 15 seconds (increased from 8 to reduce flashing)
     const intervalId = setInterval(() => {
-      if (viewingScheduleId === null && !isRefreshing && !isLoading) {
-        fetchSchedules();
+      if (
+        viewingScheduleId === null &&
+        !isRefreshing &&
+        !isLoading &&
+        !isSubmitting &&
+        pausingScheduleIds.size === 0 &&
+        deletingScheduleIds.size === 0 &&
+        killingScheduleIds.size === 0 &&
+        inspectingScheduleIds.size === 0
+      ) {
+        fetchSchedules(true); // Pass true to indicate this is a refresh
       }
-    }, 10000);
+    }, 15000); // Increased from 8000 to 15000 (15 seconds)
 
     // Clean up on unmount
     return () => {
       clearInterval(intervalId);
     };
-  }, [viewingScheduleId, isRefreshing, isLoading]);
+  }, [
+    viewingScheduleId,
+    isRefreshing,
+    isLoading,
+    isSubmitting,
+    pausingScheduleIds.size,
+    deletingScheduleIds.size,
+    killingScheduleIds.size,
+    inspectingScheduleIds.size,
+    fetchSchedules,
+  ]);
 
   const handleOpenCreateModal = () => {
     setSubmitApiError(null);
     setIsCreateModalOpen(true);
   };
 
-  const handleRefresh = async () => {
+  const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
     try {
       await fetchSchedules();
     } finally {
       setIsRefreshing(false);
     }
-  };
+  }, [fetchSchedules]);
 
   const handleCloseCreateModal = () => {
     setIsCreateModalOpen(false);
@@ -340,15 +548,6 @@ const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
     setViewingScheduleId(null);
   };
 
-  const getReadableCron = (cronString: string) => {
-    try {
-      return cronstrue.toString(cronString);
-    } catch (e) {
-      console.warn(`Could not parse cron string "${cronString}":`, e);
-      return cronString;
-    }
-  };
-
   if (viewingScheduleId) {
     return (
       <ScheduleDetailView
@@ -359,214 +558,90 @@ const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
   }
 
   return (
-    <div className="h-screen w-full flex flex-col bg-app text-textStandard">
-      <MoreMenuLayout showMenu={false} />
-      <div className="px-8 pt-6 pb-4 border-b border-borderSubtle flex-shrink-0">
-        <BackButton onClick={onClose} />
-        <h1 className="text-2xl font-semibold text-gray-900 dark:text-white mt-2">
-          Schedules Management
-        </h1>
-      </div>
-
-      <ScrollArea className="flex-grow">
-        <div className="p-8">
-          <div className="flex flex-col md:flex-row gap-2 mb-8">
-            <Button
-              onClick={handleOpenCreateModal}
-              className="w-full md:w-auto flex items-center gap-2 justify-center text-white dark:text-black bg-bgAppInverse hover:bg-bgStandardInverse [&>svg]:!size-4"
-            >
-              <Plus className="h-4 w-4" /> Create New Schedule
-            </Button>
-
-            <Button
-              onClick={handleRefresh}
-              disabled={isRefreshing || isLoading}
-              variant="outline"
-              className="w-full md:w-auto flex items-center gap-2 justify-center"
-            >
-              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-              {isRefreshing ? 'Refreshing...' : 'Refresh'}
-            </Button>
+    <>
+      <MainPanelLayout>
+        <div className="flex-1 flex flex-col min-h-0">
+          <div className="bg-background-default px-8 pb-8 pt-16">
+            <div className="flex flex-col page-transition">
+              <div className="flex justify-between items-center mb-1">
+                <h1 className="text-4xl font-light">Scheduler</h1>
+                <div className="flex gap-2">
+                  <Button
+                    onClick={handleRefresh}
+                    disabled={isRefreshing || isLoading}
+                    variant="outline"
+                    size="sm"
+                    className="flex items-center gap-2"
+                  >
+                    <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+                    {isRefreshing ? 'Refreshing...' : 'Refresh'}
+                  </Button>
+                  <Button
+                    onClick={handleOpenCreateModal}
+                    size="sm"
+                    className="flex items-center gap-2"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Create Schedule
+                  </Button>
+                </div>
+              </div>
+              <p className="text-sm text-text-muted mb-1">
+                Create and manage scheduled tasks to run recipes automatically at specified times.
+              </p>
+            </div>
           </div>
 
-          {apiError && (
-            <p className="text-red-500 dark:text-red-400 text-sm p-4 bg-red-100 dark:bg-red-900/30 border border-red-500 dark:border-red-700 rounded-md">
-              Error: {apiError}
-            </p>
-          )}
+          <div className="flex-1 min-h-0 relative px-8">
+            <ScrollArea className="h-full">
+              <div className="h-full relative">
+                {apiError && (
+                  <div className="mb-4 p-4 bg-background-error border border-border-error rounded-md">
+                    <p className="text-text-error text-sm">Error: {apiError}</p>
+                  </div>
+                )}
 
-          <section>
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">
-              Existing Schedules
-            </h2>
-            {isLoading && schedules.length === 0 && (
-              <p className="text-gray-500 dark:text-gray-400">Loading schedules...</p>
-            )}
-            {!isLoading && !apiError && schedules.length === 0 && (
-              <p className="text-gray-500 dark:text-gray-400 text-center py-4">
-                No schedules found. Create one to get started!
-              </p>
-            )}
+                {isLoading && schedules.length === 0 && (
+                  <div className="flex justify-center items-center py-12">
+                    <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-text-default"></div>
+                  </div>
+                )}
 
-            {!isLoading && schedules.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {schedules.map((job) => (
-                  <Card
-                    key={job.id}
-                    className="p-4 bg-white dark:bg-gray-800 shadow cursor-pointer hover:shadow-lg transition-shadow duration-200"
-                    onClick={() => handleNavigateToScheduleDetail(job.id)}
-                  >
-                    <div className="flex justify-between items-start">
-                      <div className="flex-grow mr-2 overflow-hidden">
-                        <h3
-                          className="text-base font-semibold text-gray-900 dark:text-white truncate"
-                          title={job.id}
-                        >
-                          {job.id}
-                        </h3>
-                        <p
-                          className="text-xs text-gray-500 dark:text-gray-400 mt-1 break-all"
-                          title={job.source}
-                        >
-                          Source: {job.source}
-                        </p>
-                        <p
-                          className="text-xs text-gray-500 dark:text-gray-400 mt-1"
-                          title={getReadableCron(job.cron)}
-                        >
-                          Schedule: {getReadableCron(job.cron)}
-                        </p>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                          Last Run:{' '}
-                          {job.last_run ? new Date(job.last_run).toLocaleString() : 'Never'}
-                        </p>
-                        {job.currently_running && (
-                          <p className="text-xs text-green-500 dark:text-green-400 mt-1 font-semibold flex items-center">
-                            <span className="inline-block w-2 h-2 bg-green-500 dark:bg-green-400 rounded-full mr-1 animate-pulse"></span>
-                            Currently Running
-                          </p>
-                        )}
-                        {job.paused && (
-                          <p className="text-xs text-orange-500 dark:text-orange-400 mt-1 font-semibold flex items-center">
-                            <Pause className="w-3 h-3 mr-1" />
-                            Paused
-                          </p>
-                        )}
-                      </div>
-                      <div className="flex-shrink-0 flex items-center gap-1">
-                        {!job.currently_running && (
-                          <>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleOpenEditModal(job);
-                              }}
-                              className="text-gray-500 dark:text-gray-400 hover:text-blue-500 dark:hover:text-blue-400 hover:bg-blue-100/50 dark:hover:bg-blue-900/30"
-                              title={`Edit schedule ${job.id}`}
-                              disabled={
-                                pausingScheduleIds.has(job.id) ||
-                                deletingScheduleIds.has(job.id) ||
-                                isSubmitting
-                              }
-                            >
-                              <Edit className="w-4 h-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (job.paused) {
-                                  handleUnpauseSchedule(job.id);
-                                } else {
-                                  handlePauseSchedule(job.id);
-                                }
-                              }}
-                              className={`${
-                                job.paused
-                                  ? 'text-green-500 dark:text-green-400 hover:text-green-600 dark:hover:text-green-300 hover:bg-green-100/50 dark:hover:bg-green-900/30'
-                                  : 'text-orange-500 dark:text-orange-400 hover:text-orange-600 dark:hover:text-orange-300 hover:bg-orange-100/50 dark:hover:bg-orange-900/30'
-                              }`}
-                              title={
-                                job.paused
-                                  ? `Unpause schedule ${job.id}`
-                                  : `Pause schedule ${job.id}`
-                              }
-                              disabled={
-                                pausingScheduleIds.has(job.id) || deletingScheduleIds.has(job.id)
-                              }
-                            >
-                              {job.paused ? (
-                                <Play className="w-4 h-4" />
-                              ) : (
-                                <Pause className="w-4 h-4" />
-                              )}
-                            </Button>
-                          </>
-                        )}
-                        {job.currently_running && (
-                          <>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleInspectRunningJob(job.id);
-                              }}
-                              className="text-blue-500 dark:text-blue-400 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-blue-100/50 dark:hover:bg-blue-900/30"
-                              title={`Inspect running job ${job.id}`}
-                              disabled={
-                                inspectingScheduleIds.has(job.id) || killingScheduleIds.has(job.id)
-                              }
-                            >
-                              <Eye className="w-4 h-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleKillRunningJob(job.id);
-                              }}
-                              className="text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 hover:bg-red-100/50 dark:hover:bg-red-900/30"
-                              title={`Kill running job ${job.id}`}
-                              disabled={
-                                killingScheduleIds.has(job.id) || inspectingScheduleIds.has(job.id)
-                              }
-                            >
-                              <Square className="w-4 h-4" />
-                            </Button>
-                          </>
-                        )}
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteSchedule(job.id);
-                          }}
-                          className="text-gray-500 dark:text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-100/50 dark:hover:bg-red-900/30"
-                          title={`Delete schedule ${job.id}`}
-                          disabled={
-                            pausingScheduleIds.has(job.id) ||
-                            deletingScheduleIds.has(job.id) ||
-                            killingScheduleIds.has(job.id) ||
-                            inspectingScheduleIds.has(job.id)
-                          }
-                        >
-                          <TrashIcon className="w-5 h-5" />
-                        </Button>
-                      </div>
-                    </div>
-                  </Card>
-                ))}
+                {!isLoading && !apiError && schedules.length === 0 && (
+                  <div className="flex flex-col pt-4 pb-12">
+                    <CircleDotDashed className="h-5 w-5 text-text-muted mb-3.5" />
+                    <p className="text-base text-text-muted font-light mb-2">No schedules yet</p>
+                  </div>
+                )}
+
+                {!isLoading && schedules.length > 0 && (
+                  <div className="space-y-2 pb-8">
+                    {schedules.map((job) => (
+                      <ScheduleCard
+                        key={job.id}
+                        job={job}
+                        onNavigateToDetail={handleNavigateToScheduleDetail}
+                        onEdit={handleOpenEditModal}
+                        onPause={handlePauseSchedule}
+                        onUnpause={handleUnpauseSchedule}
+                        onKill={handleKillRunningJob}
+                        onInspect={handleInspectRunningJob}
+                        onDelete={handleDeleteSchedule}
+                        isPausing={pausingScheduleIds.has(job.id)}
+                        isDeleting={deletingScheduleIds.has(job.id)}
+                        isKilling={killingScheduleIds.has(job.id)}
+                        isInspecting={inspectingScheduleIds.has(job.id)}
+                        isSubmitting={isSubmitting}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
-            )}
-          </section>
+            </ScrollArea>
+          </div>
         </div>
-      </ScrollArea>
+      </MainPanelLayout>
+
       <CreateScheduleModal
         isOpen={isCreateModalOpen}
         onClose={handleCloseCreateModal}
@@ -582,7 +657,7 @@ const SchedulesView: React.FC<SchedulesViewProps> = ({ onClose }) => {
         isLoadingExternally={isSubmitting}
         apiErrorExternally={submitApiError}
       />
-    </div>
+    </>
   );
 };
 

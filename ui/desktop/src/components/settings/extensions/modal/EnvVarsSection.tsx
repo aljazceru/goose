@@ -10,6 +10,7 @@ interface EnvVarsSectionProps {
   onRemove: (index: number) => void;
   onChange: (index: number, field: 'key' | 'value', value: string) => void;
   submitAttempted: boolean;
+  onPendingInputChange?: (hasPendingInput: boolean) => void;
 }
 
 export default function EnvVarsSection({
@@ -18,6 +19,7 @@ export default function EnvVarsSection({
   onRemove,
   onChange,
   submitAttempted,
+  onPendingInputChange,
 }: EnvVarsSectionProps) {
   const [newKey, setNewKey] = React.useState('');
   const [newValue, setNewValue] = React.useState('');
@@ -26,6 +28,12 @@ export default function EnvVarsSection({
     key: false,
     value: false,
   });
+
+  // Notify parent when pending input changes
+  React.useEffect(() => {
+    const hasPendingInput = newKey.trim() !== '' || newValue.trim() !== '';
+    onPendingInputChange?.(hasPendingInput);
+  }, [newKey, newValue, onPendingInputChange]);
 
   const handleAdd = () => {
     const keyEmpty = !newKey.trim();
@@ -180,7 +188,7 @@ export default function EnvVarsSection({
           <Button
             onClick={handleAdd}
             variant="ghost"
-            className="flex items-center justify-start gap-1 px-2 pr-4 text-sm rounded-full text-textStandard bg-bgApp border border-borderSubtle hover:border-borderStandard transition-colors min-w-[60px] h-9 [&>svg]:!size-4"
+            className="flex items-center justify-start gap-1 px-2 pr-4 text-sm rounded-full text-textStandard bg-background-default border border-borderSubtle hover:border-borderStandard transition-colors min-w-[60px] h-9 [&>svg]:!size-4"
           >
             <Plus /> Add
           </Button>

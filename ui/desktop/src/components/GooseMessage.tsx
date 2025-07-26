@@ -29,6 +29,7 @@ interface GooseMessageProps {
   toolCallNotifications: Map<string, NotificationEvent[]>;
   append: (value: string) => void;
   appendMessage: (message: Message) => void;
+  isStreaming?: boolean; // Whether this message is currently being streamed
 }
 
 export default function GooseMessage({
@@ -39,18 +40,38 @@ export default function GooseMessage({
   toolCallNotifications,
   append,
   appendMessage,
+  isStreaming = false,
 }: GooseMessageProps) {
   const contentRef = useRef<HTMLDivElement>(null);
+  // Track which tool confirmations we've already handled to prevent infinite loops
+  const handledToolConfirmations = useRef<Set<string>>(new Set());
 
   // Extract text content from the message
   let textContent = getTextContent(message);
 
-  // Extract image paths from the message
-  const imagePaths = extractImagePaths(textContent);
+  // Utility to split Chain-of-Thought (CoT) from the visible assistant response.
+  // If the text contains a <think>...</think> block, everything inside is treated as the
+  // CoT and removed from the user-visible text.
+  const splitChainOfThought = (text: string): { visibleText: string; cotText: string | null } => {
+    const regex = /<think>([\s\S]*?)<\/think>/i;
+    const match = text.match(regex);
+    if (!match) {
+      return { visibleText: text, cotText: null };
+    }
+
+    const cotRaw = match[1].trim();
+    const visible = text.replace(match[0], '').trim();
+    return { visibleText: visible, cotText: cotRaw.length > 0 ? cotRaw : null };
+  };
+
+  const { visibleText: textWithoutCot, cotText } = splitChainOfThought(textContent);
+
+  // Extract image paths from the visible part of the message (exclude CoT)
+  const imagePaths = extractImagePaths(textWithoutCot);
 
   // Remove image paths from text for display
   const displayText =
-    imagePaths.length > 0 ? removeImagePathsFromText(textContent, imagePaths) : textContent;
+    imagePaths.length > 0 ? removeImagePathsFromText(textWithoutCot, imagePaths) : textWithoutCot;
 
   // Memoize the timestamp
   const timestamp = useMemo(() => formatMessageTimestamp(message.created), [message.created]);
@@ -98,26 +119,51 @@ export default function GooseMessage({
     if (
       messageIndex === messageHistoryIndex - 1 &&
       hasToolConfirmation &&
-      toolConfirmationContent
+      toolConfirmationContent &&
+      !handledToolConfirmations.current.has(toolConfirmationContent.id)
     ) {
-      appendMessage(
-        createToolErrorResponseMessage(toolConfirmationContent.id, 'The tool call is cancelled.')
+      // Only append the error message if there isn't already a response for this tool confirmation
+      const hasExistingResponse = messages.some((msg) =>
+        getToolResponses(msg).some((response) => response.id === toolConfirmationContent.id)
       );
+
+      if (!hasExistingResponse) {
+        // Mark this tool confirmation as handled to prevent infinite loop
+        handledToolConfirmations.current.add(toolConfirmationContent.id);
+
+        appendMessage(
+          createToolErrorResponseMessage(toolConfirmationContent.id, 'The tool call is cancelled.')
+        );
+      }
     }
   }, [
     messageIndex,
     messageHistoryIndex,
     hasToolConfirmation,
     toolConfirmationContent,
+    messages,
     appendMessage,
   ]);
 
   return (
-    <div className="goose-message flex w-[90%] justify-start opacity-0 animate-[appear_150ms_ease-in_forwards]">
-      <div className="flex flex-col w-full">
-        {textContent && (
+    <div className="goose-message flex w-[90%] justify-start min-w-0">
+      <div className="flex flex-col w-full min-w-0">
+        {/* Chain-of-Thought (hidden by default) */}
+        {cotText && (
+          <details className="bg-bgSubtle border border-borderSubtle rounded p-2 mb-2">
+            <summary className="cursor-pointer text-sm text-textSubtle select-none">
+              Show thinking
+            </summary>
+            <div className="mt-2">
+              <MarkdownContent content={cotText} />
+            </div>
+          </details>
+        )}
+
+        {/* Visible assistant response */}
+        {displayText && (
           <div className="flex flex-col group">
-            <div className={`goose-message-content pt-2`}>
+            <div className={`goose-message-content py-2`}>
               <div ref={contentRef}>{<MarkdownContent content={displayText} />}</div>
             </div>
 
@@ -130,18 +176,20 @@ export default function GooseMessage({
               </div>
             )}
 
-            {/* Only show MessageCopyLink if there's text content and no tool requests/responses */}
+            {/* Only show timestamp and copy link when not streaming */}
             <div className="relative flex justify-start">
-              {toolRequests.length === 0 && (
-                <div className="text-xs text-textSubtle pt-1 transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0">
+              {toolRequests.length === 0 && !isStreaming && (
+                <div className="text-xs font-mono text-text-muted pt-1 transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0">
                   {timestamp}
                 </div>
               )}
-              {textContent && message.content.every((content) => content.type === 'text') && (
-                <div className="absolute left-0 pt-1">
-                  <MessageCopyLink text={displayText} contentRef={contentRef} />
-                </div>
-              )}
+              {displayText &&
+                message.content.every((content) => content.type === 'text') &&
+                !isStreaming && (
+                  <div className="absolute left-0 pt-1">
+                    <MessageCopyLink text={displayText} contentRef={contentRef} />
+                  </div>
+                )}
             </div>
           </div>
         )}
@@ -149,10 +197,7 @@ export default function GooseMessage({
         {toolRequests.length > 0 && (
           <div className="relative flex flex-col w-full">
             {toolRequests.map((toolRequest) => (
-              <div
-                className={`goose-message-tool bg-bgSubtle rounded px-2 py-2 mb-2`}
-                key={toolRequest.id}
-              >
+              <div className={`goose-message-tool pb-2`} key={toolRequest.id}>
                 <ToolCallWithResponse
                   // If the message is resumed and not matched tool response, it means the tool is broken or cancelled.
                   isCancelledMessage={
@@ -162,11 +207,12 @@ export default function GooseMessage({
                   toolRequest={toolRequest}
                   toolResponse={toolResponsesMap.get(toolRequest.id)}
                   notifications={toolCallNotifications.get(toolRequest.id)}
+                  isStreamingMessage={isStreaming}
                 />
               </div>
             ))}
-            <div className="text-xs text-textSubtle pt-1 transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0">
-              {timestamp}
+            <div className="text-xs text-text-muted pt-1 transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0">
+              {!isStreaming && timestamp}
             </div>
           </div>
         )}
@@ -174,7 +220,7 @@ export default function GooseMessage({
         {hasToolConfirmation && (
           <ToolCallConfirmation
             isCancelledMessage={messageIndex == messageHistoryIndex - 1}
-            isClicked={messageIndex < messageHistoryIndex - 1}
+            isClicked={messageIndex < messageHistoryIndex}
             toolConfirmationId={toolConfirmationContent.id}
             toolName={toolConfirmationContent.toolName}
           />
@@ -194,7 +240,7 @@ export default function GooseMessage({
       {/* NOTE from alexhancock on 1/14/2025 - disabling again temporarily due to non-determinism in when the forms show up */}
       {false && metadata && (
         <div className="flex mt-[16px]">
-          <GooseResponseForm message={textContent} metadata={metadata || null} append={append} />
+          <GooseResponseForm message={displayText} metadata={metadata || null} append={append} />
         </div>
       )}
     </div>

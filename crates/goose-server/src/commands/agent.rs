@@ -6,15 +6,26 @@ use anyhow::Result;
 use etcetera::{choose_app_strategy, AppStrategy};
 use goose::agents::Agent;
 use goose::config::APP_STRATEGY;
-use goose::scheduler::Scheduler as GooseScheduler;
+use goose::scheduler_factory::SchedulerFactory;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+
+use goose::providers::pricing::initialize_pricing_cache;
 
 pub async fn run() -> Result<()> {
     // Initialize logging
     crate::logging::setup_logging(Some("goosed"))?;
 
     let settings = configuration::Settings::new()?;
+
+    // Initialize pricing cache on startup
+    tracing::info!("Initializing pricing cache...");
+    if let Err(e) = initialize_pricing_cache().await {
+        tracing::warn!(
+            "Failed to initialize pricing cache: {}. Pricing data may not be available.",
+            e
+        );
+    }
 
     let secret_key =
         std::env::var("GOOSE_SERVER__SECRET_KEY").unwrap_or_else(|_| "test".to_string());
@@ -28,8 +39,11 @@ pub async fn run() -> Result<()> {
         .data_dir()
         .join("schedules.json");
 
-    let scheduler_instance = GooseScheduler::new(schedule_file_path).await?;
-    app_state.set_scheduler(scheduler_instance).await;
+    let scheduler_instance = SchedulerFactory::create(schedule_file_path).await?;
+    app_state.set_scheduler(scheduler_instance.clone()).await;
+
+    // NEW: Provide scheduler access to the agent
+    agent_ref.set_scheduler(scheduler_instance).await;
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

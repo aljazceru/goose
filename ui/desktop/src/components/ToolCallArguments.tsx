@@ -28,7 +28,7 @@ export function ToolCallArguments({ args }: ToolCallArgumentsProps) {
 
       if (!needsExpansion) {
         return (
-          <div className="text-sm mb-2">
+          <div className="text-xs mb-2">
             <div className="flex flex-row">
               <span className="text-textSubtle min-w-[140px]">{key}</span>
               <span className="text-textPlaceholder">{value}</span>
@@ -39,20 +39,28 @@ export function ToolCallArguments({ args }: ToolCallArgumentsProps) {
 
       return (
         <div className="text-sm mb-2">
-          <div className="flex flex-row">
-            <span className="text-textSubtle min-w-[140px]">{key}</span>
-            <div className="w-full flex justify-between items-start">
+          <div className="flex flex-row items-stretch">
+            <button
+              onClick={() => toggleKey(key)}
+              className="flex text-left text-textSubtle min-w-[140px]"
+            >
+              <span>{key}</span>
+            </button>
+            <div className="w-full flex items-stretch">
               {isExpanded ? (
-                <div className="">
+                <div>
                   <MarkdownContent content={value} className="text-sm text-textPlaceholder" />
                 </div>
               ) : (
-                <span className="text-textPlaceholder mr-2">{value.slice(0, 60)}...</span>
+                <button onClick={() => toggleKey(key)} className="text-left text-textPlaceholder">
+                  {value.slice(0, 60)}...
+                </button>
               )}
               <button
                 onClick={() => toggleKey(key)}
-                className="hover:opacity-75 text-textPlaceholder pr-2"
+                className="flex flex-row items-stretch grow text-textPlaceholder pr-2"
               >
+                <div className="min-w-2 grow" />
                 <Expand size={5} isExpanded={isExpanded} />
               </button>
             </div>
@@ -70,9 +78,11 @@ export function ToolCallArguments({ args }: ToolCallArgumentsProps) {
 
     return (
       <div className="mb-2">
-        <div className="flex flex-row">
-          <span className="mr- text-textPlaceholder min-w-[140px]2">{key}:</span>
-          <pre className="whitespace-pre-wrap text-textPlaceholder">{content}</pre>
+        <div className="flex flex-row text-xs">
+          <span className="text-textSubtle min-w-[140px]">{key}</span>
+          <pre className="whitespace-pre-wrap text-textPlaceholder overflow-x-auto max-w-full">
+            {content}
+          </pre>
         </div>
       </div>
     );

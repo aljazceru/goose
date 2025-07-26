@@ -19,7 +19,8 @@ use super::utils::{emit_debug_trace, get_model, handle_response_openai_compat, I
 use crate::config::{Config, ConfigError};
 use crate::message::Message;
 use crate::model::ModelConfig;
-use mcp_core::tool::Tool;
+use crate::providers::base::ConfigKey;
+use rmcp::model::Tool;
 
 pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-4o";
 pub const GITHUB_COPILOT_KNOWN_MODELS: &[&str] = &[
@@ -136,9 +137,9 @@ impl GithubCopilotProvider {
         })
     }
 
-    async fn post(&self, mut payload: Value) -> Result<Value, ProviderError> {
+    async fn post(&self, payload: &mut Value) -> Result<Value, ProviderError> {
         use crate::providers::utils_universal_openai_stream::{OAIStreamChunk, OAIStreamCollector};
-        use futures_util::StreamExt;
+        use futures::StreamExt;
         // Detect gpt-4.1 and stream
         let model_name = payload.get("model").and_then(|v| v.as_str()).unwrap_or("");
         let stream_only_model = GITHUB_COPILOT_STREAM_MODELS
@@ -158,7 +159,7 @@ impl GithubCopilotProvider {
             .post(url)
             .headers(self.get_github_headers())
             .header("Authorization", format!("Bearer {}", token))
-            .json(&payload)
+            .json(payload)
             .send()
             .await?;
         if stream_only_model {
@@ -389,7 +390,7 @@ impl Provider for GithubCopilotProvider {
             GITHUB_COPILOT_DEFAULT_MODEL,
             GITHUB_COPILOT_KNOWN_MODELS.to_vec(),
             GITHUB_COPILOT_DOC_URL,
-            vec![],
+            vec![ConfigKey::new("GITHUB_COPILOT_TOKEN", true, true, None)],
         )
     }
 
@@ -407,21 +408,18 @@ impl Provider for GithubCopilotProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
-        let payload = create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
+        let mut payload =
+            create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
 
         // Make request
-        let response = self.post(payload.clone()).await?;
+        let response = self.post(&mut payload).await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
-        let usage = match get_usage(&response) {
-            Ok(usage) => usage,
-            Err(ProviderError::UsageError(e)) => {
-                tracing::debug!("Failed to get usage data: {}", e);
-                Usage::default()
-            }
-            Err(e) => return Err(e),
-        };
+        let message = response_to_message(&response)?;
+        let usage = response.get("usage").map(get_usage).unwrap_or_else(|| {
+            tracing::debug!("Failed to get usage data");
+            Usage::default()
+        });
         let model = get_model(&response);
         emit_debug_trace(&self.model, &payload, &response, &usage);
         Ok((message, ProviderUsage::new(model, usage)))

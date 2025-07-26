@@ -1,13 +1,16 @@
 use anyhow::Result;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use super::errors::ProviderError;
 use crate::message::Message;
 use crate::model::ModelConfig;
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 use utoipa::ToSchema;
 
 use once_cell::sync::Lazy;
+use std::ops::{Add, AddAssign};
+use std::pin::Pin;
 use std::sync::Mutex;
 
 /// A global store for the current model being used, we use this as when a provider returns, it tells us the real model, not an alias
@@ -32,6 +35,45 @@ pub struct ModelInfo {
     pub name: String,
     /// The maximum context length this model supports
     pub context_limit: usize,
+    /// Cost per token for input (optional)
+    pub input_token_cost: Option<f64>,
+    /// Cost per token for output (optional)
+    pub output_token_cost: Option<f64>,
+    /// Currency for the costs (default: "$")
+    pub currency: Option<String>,
+    /// Whether this model supports cache control
+    pub supports_cache_control: Option<bool>,
+}
+
+impl ModelInfo {
+    /// Create a new ModelInfo with just name and context limit
+    pub fn new(name: impl Into<String>, context_limit: usize) -> Self {
+        Self {
+            name: name.into(),
+            context_limit,
+            input_token_cost: None,
+            output_token_cost: None,
+            currency: None,
+            supports_cache_control: None,
+        }
+    }
+
+    /// Create a new ModelInfo with cost information (per token)
+    pub fn with_cost(
+        name: impl Into<String>,
+        context_limit: usize,
+        input_cost: f64,
+        output_cost: f64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            context_limit,
+            input_token_cost: Some(input_cost),
+            output_token_cost: Some(output_cost),
+            currency: Some("$".to_string()),
+            supports_cache_control: None,
+        }
+    }
 }
 
 /// Metadata about a provider's configuration requirements and capabilities
@@ -74,8 +116,33 @@ impl ProviderMetadata {
                 .map(|&name| ModelInfo {
                     name: name.to_string(),
                     context_limit: ModelConfig::new(name.to_string()).context_limit(),
+                    input_token_cost: None,
+                    output_token_cost: None,
+                    currency: None,
+                    supports_cache_control: None,
                 })
                 .collect(),
+            model_doc_link: model_doc_link.to_string(),
+            config_keys,
+        }
+    }
+
+    /// Create a new ProviderMetadata with ModelInfo objects that include cost data
+    pub fn with_models(
+        name: &str,
+        display_name: &str,
+        description: &str,
+        default_model: &str,
+        models: Vec<ModelInfo>,
+        model_doc_link: &str,
+        config_keys: Vec<ConfigKey>,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            display_name: display_name.to_string(),
+            description: description.to_string(),
+            default_model: default_model.to_string(),
+            known_models: models,
             model_doc_link: model_doc_link.to_string(),
             config_keys,
         }
@@ -125,11 +192,41 @@ impl ProviderUsage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Copy)]
 pub struct Usage {
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
     pub total_tokens: Option<i32>,
+}
+
+fn sum_optionals<T>(a: Option<T>, b: Option<T>) -> Option<T>
+where
+    T: Add<Output = T> + Default,
+{
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (Some(x), None) => Some(x + T::default()),
+        (None, Some(y)) => Some(T::default() + y),
+        (None, None) => None,
+    }
+}
+
+impl Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            input_tokens: sum_optionals(self.input_tokens, other.input_tokens),
+            output_tokens: sum_optionals(self.output_tokens, other.output_tokens),
+            total_tokens: sum_optionals(self.total_tokens, other.total_tokens),
+        }
+    }
+}
+
+impl AddAssign for Usage {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
 }
 
 impl Usage {
@@ -152,6 +249,9 @@ use async_trait::async_trait;
 pub trait LeadWorkerProviderTrait {
     /// Get information about the lead and worker models for logging
     fn get_model_info(&self) -> (String, String);
+
+    /// Get the currently active model name
+    fn get_active_model(&self) -> String;
 }
 
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
@@ -195,6 +295,11 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Check if this provider supports cache control
+    fn supports_cache_control(&self) -> bool {
+        false
+    }
+
     /// Create embeddings if supported. Default implementation returns an error.
     async fn create_embeddings(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, ProviderError> {
         Err(ProviderError::ExecutionError(
@@ -207,6 +312,44 @@ pub trait Provider: Send + Sync {
     fn as_lead_worker(&self) -> Option<&dyn LeadWorkerProviderTrait> {
         None
     }
+
+    async fn stream(
+        &self,
+        _system: &str,
+        _messages: &[Message],
+        _tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        Err(ProviderError::NotImplemented(
+            "streaming not implemented".to_string(),
+        ))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Get the currently active model name
+    /// For regular providers, this returns the configured model
+    /// For LeadWorkerProvider, this returns the currently active model (lead or worker)
+    fn get_active_model_name(&self) -> String {
+        if let Some(lead_worker) = self.as_lead_worker() {
+            lead_worker.get_active_model()
+        } else {
+            self.get_model_config().model_name
+        }
+    }
+}
+
+/// A message stream yields partial text content but complete tool calls, all within the Message object
+/// So a message with text will contain potentially just a word of a longer response, but tool calls
+/// messages will only be yielded once concatenated.
+pub type MessageStream = Pin<
+    Box<dyn Stream<Item = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>> + Send>,
+>;
+
+pub fn stream_from_single_message(message: Message, usage: ProviderUsage) -> MessageStream {
+    let stream = futures::stream::once(async move { Ok((Some(message), Some(usage))) });
+    Box::pin(stream)
 }
 
 #[cfg(test)]
@@ -299,6 +442,10 @@ mod tests {
         let info = ModelInfo {
             name: "test-model".to_string(),
             context_limit: 1000,
+            input_token_cost: None,
+            output_token_cost: None,
+            currency: None,
+            supports_cache_control: None,
         };
         assert_eq!(info.context_limit, 1000);
 
@@ -306,6 +453,10 @@ mod tests {
         let info2 = ModelInfo {
             name: "test-model".to_string(),
             context_limit: 1000,
+            input_token_cost: None,
+            output_token_cost: None,
+            currency: None,
+            supports_cache_control: None,
         };
         assert_eq!(info, info2);
 
@@ -313,7 +464,21 @@ mod tests {
         let info3 = ModelInfo {
             name: "test-model".to_string(),
             context_limit: 2000,
+            input_token_cost: None,
+            output_token_cost: None,
+            currency: None,
+            supports_cache_control: None,
         };
         assert_ne!(info, info3);
+    }
+
+    #[test]
+    fn test_model_info_with_cost() {
+        let info = ModelInfo::with_cost("gpt-4o", 128000, 0.0000025, 0.00001);
+        assert_eq!(info.name, "gpt-4o");
+        assert_eq!(info.context_limit, 128000);
+        assert_eq!(info.input_token_cost, Some(0.0000025));
+        assert_eq!(info.output_token_cost, Some(0.00001));
+        assert_eq!(info.currency, Some("$".to_string()));
     }
 }

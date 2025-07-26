@@ -12,14 +12,14 @@ use super::utils::{get_model, ImageFormat};
 use crate::config::ConfigError;
 use crate::message::Message;
 use crate::model::ModelConfig;
-use mcp_core::tool::Tool;
+use rmcp::model::Tool;
 use url::Url;
 
 pub const SNOWFLAKE_DEFAULT_MODEL: &str = "claude-3-7-sonnet";
 pub const SNOWFLAKE_KNOWN_MODELS: &[&str] = &["claude-3-7-sonnet", "claude-3-5-sonnet"];
 
 pub const SNOWFLAKE_DOC_URL: &str =
-    "https://docs.snowflake.com/en/user-guide/snowflake-cortex/llm-functions#choosing-a-model";
+    "https://docs.snowflake.com/user-guide/snowflake-cortex/aisql#choosing-a-model";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SnowflakeAuth {
@@ -108,7 +108,7 @@ impl SnowflakeProvider {
         }
     }
 
-    async fn post(&self, payload: Value) -> Result<Value, ProviderError> {
+    async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
         let base_url_str =
             if !self.host.starts_with("https://") && !self.host.starts_with("http://") {
                 format!("https://{}", self.host)
@@ -318,7 +318,7 @@ impl SnowflakeProvider {
                     .unwrap_or_else(|| "Invalid credentials".to_string());
 
                 Err(ProviderError::Authentication(format!(
-                    "Authentication failed. Please check your SNOWFLAKE_TOKEN and SNOWFLAKE_HOST configuration. Error: {}", 
+                    "Authentication failed. Please check your SNOWFLAKE_TOKEN and SNOWFLAKE_HOST configuration. Error: {}",
                     error_msg
                 )))
             }
@@ -399,7 +399,7 @@ impl Provider for SnowflakeProvider {
         ProviderMetadata::new(
             "snowflake",
             "Snowflake",
-            "Access several models using Snowflake Cortex services.",
+            "Access the latest models using Snowflake Cortex services.",
             SNOWFLAKE_DEFAULT_MODEL,
             SNOWFLAKE_KNOWN_MODELS.to_vec(),
             SNOWFLAKE_DOC_URL,
@@ -426,10 +426,10 @@ impl Provider for SnowflakeProvider {
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let payload = create_request(&self.model, system, messages, tools)?;
 
-        let response = self.post(payload.clone()).await?;
+        let response = self.post(&payload).await?;
 
         // Parse response
-        let message = response_to_message(response.clone())?;
+        let message = response_to_message(&response)?;
         let usage = get_usage(&response)?;
         let model = get_model(&response);
         super::utils::emit_debug_trace(&self.model, &payload, &response, &usage);

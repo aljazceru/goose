@@ -16,9 +16,11 @@ pub struct CompletionRequest {
     pub provider_name: String,
     pub provider_config: serde_json::Value,
     pub model_config: ModelConfig,
-    pub system_preamble: String,
+    pub system_preamble: Option<String>,
+    pub system_prompt_override: Option<String>,
     pub messages: Vec<Message>,
     pub extensions: Vec<ExtensionConfig>,
+    pub request_id: Option<String>,
 }
 
 impl CompletionRequest {
@@ -26,7 +28,8 @@ impl CompletionRequest {
         provider_name: String,
         provider_config: serde_json::Value,
         model_config: ModelConfig,
-        system_preamble: String,
+        system_preamble: Option<String>,
+        system_prompt_override: Option<String>,
         messages: Vec<Message>,
         extensions: Vec<ExtensionConfig>,
     ) -> Self {
@@ -34,30 +37,47 @@ impl CompletionRequest {
             provider_name,
             provider_config,
             model_config,
+            system_prompt_override,
             system_preamble,
             messages,
             extensions,
+            request_id: None,
         }
+    }
+
+    pub fn with_request_id(mut self, request_id: String) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }
 
-#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+#[uniffi::export(default(system_preamble = None,  system_prompt_override = None))]
 pub fn create_completion_request(
     provider_name: &str,
     provider_config: JsonValueFfi,
     model_config: ModelConfig,
-    system_preamble: &str,
+    system_preamble: Option<String>,
+    system_prompt_override: Option<String>,
     messages: Vec<Message>,
     extensions: Vec<ExtensionConfig>,
+    request_id: Option<String>,
 ) -> CompletionRequest {
-    CompletionRequest::new(
+    let mut request = CompletionRequest::new(
         provider_name.to_string(),
         provider_config,
         model_config,
-        system_preamble.to_string(),
+        system_preamble,
+        system_prompt_override,
         messages,
         extensions,
-    )
+    );
+
+    if let Some(req_id) = request_id {
+        request = request.with_request_id(req_id);
+    }
+
+    request
 }
 
 uniffi::custom_type!(CompletionRequest, String, {

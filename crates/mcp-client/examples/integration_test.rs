@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures::lock::Mutex;
 use mcp_client::client::{ClientCapabilities, ClientInfo, McpClient, McpClientTrait};
-use mcp_client::transport::{SseTransport, Transport};
+use mcp_client::transport::{SseTransport, StreamableHttpTransport, Transport};
 use mcp_client::StdioTransport;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +20,19 @@ async fn main() -> Result<()> {
         .init();
 
     test_transport(sse_transport().await?).await?;
+    test_transport(streamable_http_transport().await?).await?;
     test_transport(stdio_transport().await?).await?;
+
+    // Test broken transport
+    match test_transport(broken_stdio_transport().await?).await {
+        Ok(_) => panic!("Expected an error but got success"),
+        Err(e) => {
+            assert!(e
+                .to_string()
+                .contains("error: package(s) `thispackagedoesnotexist` not found in workspace"));
+            println!("Expected error occurred: {e}");
+        }
+    }
 
     Ok(())
 }
@@ -41,10 +53,37 @@ async fn sse_transport() -> Result<SseTransport> {
     ))
 }
 
+async fn streamable_http_transport() -> Result<StreamableHttpTransport> {
+    let port = "60054";
+
+    tokio::process::Command::new("npx")
+        .env("PORT", port)
+        .arg("@modelcontextprotocol/server-everything")
+        .arg("streamable-http")
+        .spawn()?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    Ok(StreamableHttpTransport::new(
+        format!("http://localhost:{}/mcp", port),
+        HashMap::new(),
+    ))
+}
+
 async fn stdio_transport() -> Result<StdioTransport> {
     Ok(StdioTransport::new(
         "npx",
         vec!["@modelcontextprotocol/server-everything"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect(),
+        HashMap::new(),
+    ))
+}
+
+async fn broken_stdio_transport() -> Result<StdioTransport> {
+    Ok(StdioTransport::new(
+        "cargo",
+        vec!["run", "-p", "thispackagedoesnotexist"]
             .into_iter()
             .map(|s| s.to_string())
             .collect(),
@@ -109,6 +148,12 @@ where
     println!("Long op result: {long_op:#?}\n");
     let collected_events_after = events.lock().await.len();
     assert_eq!(collected_events_after - collected_eventes_before, n_steps);
+
+    let error_result = client
+        .call_tool("add", serde_json::json!({ "a": "foo", "b": "bar" }))
+        .await;
+    assert!(error_result.is_err());
+    println!("Error result: {error_result:#?}\n");
 
     // List resources
     let resources = client.list_resources(None).await?;

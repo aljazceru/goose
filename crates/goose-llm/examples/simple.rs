@@ -106,7 +106,8 @@ async fn main() -> Result<()> {
             provider.to_string(),
             provider_config.clone(),
             model_config.clone(),
-            system_preamble.to_string(),
+            Some(system_preamble.to_string()),
+            None,
             messages.clone(),
             extensions.clone(),
         ))
@@ -115,7 +116,7 @@ async fn main() -> Result<()> {
         println!("\nCompletion Response:");
         println!("{}", serde_json::to_string_pretty(&completion_response)?);
 
-        let tooltip = generate_tooltip(provider, provider_config.clone().into(), &messages).await?;
+        let tooltip = generate_tooltip(provider, provider_config.clone(), &messages, None).await?;
         println!("\nTooltip: {}", tooltip);
     }
 

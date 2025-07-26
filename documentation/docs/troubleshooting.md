@@ -38,7 +38,7 @@ This error occurs when the input provided to Goose exceeds the maximum token lim
 
 ### Using Ollama Provider
 
-Ollama provides local LLMs, which means you must first [download Ollama and run a model](/docs/getting-started/providers#local-llms-ollama) before attempting to use this provider with Goose. If you do not have the model downloaded, you'll run into the following error:
+Ollama provides local LLMs, which means you must first [download Ollama and run a model](/docs/getting-started/providers#local-llms) before attempting to use this provider with Goose. If you do not have the model downloaded, you'll run into the following error:
 
 > ExecutionError("error sending request for url (http://localhost:11434/v1/chat/completions)")
 
@@ -172,7 +172,7 @@ When the keyring is disabled, secrets are stored here:
 Many of the external extensions require a package runner. For example, if you run into an error like this one:
 
 ```
-Failed to start extension: {extension name}, "No such file or directory (os error 2)"
+Failed to start extension `{extension name}`: Could not run extension command (`{extension command}`): No such file or directory (os error 2)
 Please check extension configuration for {extension name}.
 ```
 
