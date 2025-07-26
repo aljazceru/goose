@@ -4,7 +4,13 @@ mod export;
 mod input;
 mod output;
 mod prompt;
+mod task_execution_display;
 mod thinking;
+
+use crate::session::task_execution_display::{
+    format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
+};
+use std::io::Write;
 
 pub use self::export::message_to_markdown;
 pub use builder::{build_session, SessionBuilderConfig, SessionSettings};
@@ -22,6 +28,7 @@ use anyhow::{Context, Result};
 use completion::GooseCompleter;
 use etcetera::{choose_app_strategy, AppStrategy};
 use goose::agents::extension::{Envs, ExtensionConfig};
+use goose::agents::types::RetryConfig;
 use goose::agents::{Agent, SessionConfig};
 use goose::config::Config;
 use goose::message::{Message, MessageContent};
@@ -29,9 +36,8 @@ use goose::providers::pricing::initialize_pricing_cache;
 use goose::session;
 use input::InputResult;
 use mcp_core::handler::ToolError;
-use mcp_core::prompt::PromptMessage;
-use mcp_core::protocol::JsonRpcMessage;
-use mcp_core::protocol::JsonRpcNotification;
+use rmcp::model::PromptMessage;
+use rmcp::model::ServerNotification;
 
 use rand::{distributions::Alphanumeric, Rng};
 use rustyline::EditMode;
@@ -41,6 +47,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio;
+use tokio_util::sync::CancellationToken;
 
 pub enum RunMode {
     Normal,
@@ -58,6 +65,7 @@ pub struct Session {
     scheduled_job_id: Option<String>, // ID of the scheduled job that triggered this session
     max_turns: Option<u32>,
     edit_mode: Option<EditMode>,
+    retry_config: Option<RetryConfig>,
 }
 
 // Cache structure for completion data
@@ -121,15 +129,13 @@ impl Session {
         scheduled_job_id: Option<String>,
         max_turns: Option<u32>,
         edit_mode: Option<EditMode>,
+        retry_config: Option<RetryConfig>,
     ) -> Self {
         let messages = if let Some(session_file) = &session_file {
-            match session::read_messages(session_file) {
-                Ok(msgs) => msgs,
-                Err(e) => {
-                    eprintln!("Warning: Failed to load message history: {}", e);
-                    Vec::new()
-                }
-            }
+            session::read_messages(session_file).unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to load message history: {}", e);
+                Vec::new()
+            })
         } else {
             // Don't try to read messages if we're not saving sessions
             Vec::new()
@@ -145,6 +151,7 @@ impl Session {
             scheduled_job_id,
             max_turns,
             edit_mode,
+            retry_config,
         }
     }
 
@@ -170,7 +177,7 @@ impl Session {
     ///   Format: "ENV1=val1 ENV2=val2 command args..."
     pub async fn add_extension(&mut self, extension_command: String) -> Result<()> {
         let mut parts: Vec<&str> = extension_command.split_whitespace().collect();
-        let mut envs = std::collections::HashMap::new();
+        let mut envs = HashMap::new();
 
         // Parse environment variables (format: KEY=value)
         while let Some(part) = parts.first() {
@@ -296,6 +303,7 @@ impl Session {
                 // TODO: should set a timeout
                 timeout: Some(goose::config::DEFAULT_EXTENSION_TIMEOUT),
                 bundled: None,
+                description: None,
             };
             self.agent
                 .add_extension(config)
@@ -352,8 +360,7 @@ impl Session {
     }
 
     pub async fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Vec<PromptMessage>> {
-        let result = self.agent.get_prompt(name, arguments).await?;
-        Ok(result.messages)
+        Ok(self.agent.get_prompt(name, arguments).await?.messages)
     }
 
     /// Process a single message and get the response
@@ -364,11 +371,16 @@ impl Session {
 
         // Persist messages with provider for automatic description generation
         if let Some(session_file) = &self.session_file {
+            let working_dir = Some(
+                std::env::current_dir().expect("failed to get current session working directory"),
+            );
+
             session::persist_messages_with_schedule_id(
                 session_file,
                 &self.messages,
                 Some(provider),
                 self.scheduled_job_id.clone(),
+                working_dir,
             )
             .await?;
         }
@@ -459,7 +471,7 @@ impl Session {
             self.display_context_usage().await?;
 
             match input::get_input(&mut editor)? {
-                input::InputResult::Message(content) => {
+                InputResult::Message(content) => {
                     match self.run_mode {
                         RunMode::Normal => {
                             save_history(&mut editor);
@@ -481,16 +493,18 @@ impl Session {
                                 eprintln!("Warning: Failed to update project tracker with instruction: {}", e);
                             }
 
-                            // Get the provider from the agent for description generation
                             let provider = self.agent.provider().await?;
 
                             // Persist messages with provider for automatic description generation
                             if let Some(session_file) = &self.session_file {
+                                let working_dir = Some(std::env::current_dir().unwrap_or_default());
+
                                 session::persist_messages_with_schedule_id(
                                     session_file,
                                     &self.messages,
                                     Some(provider),
                                     self.scheduled_job_id.clone(),
+                                    working_dir,
                                 )
                                 .await?;
                             }
@@ -627,6 +641,10 @@ impl Session {
                         &Message::assistant().with_text("Chat context cleared."),
                         self.debug,
                     );
+                    if let Some(file) = self.session_file.as_ref().filter(|f| f.exists()) {
+                        std::fs::remove_file(file)?;
+                        std::fs::File::create(file)?;
+                    }
                     continue;
                 }
                 input::InputResult::PromptCommand(opts) => {
@@ -698,11 +716,13 @@ impl Session {
 
                         // Persist the summarized messages
                         if let Some(session_file) = &self.session_file {
+                            let working_dir = std::env::current_dir().ok();
                             session::persist_messages_with_schedule_id(
                                 session_file,
                                 &self.messages,
                                 Some(provider),
                                 self.scheduled_job_id.clone(),
+                                working_dir,
                             )
                             .await?;
                         }
@@ -821,20 +841,23 @@ impl Session {
     }
 
     async fn process_agent_response(&mut self, interactive: bool) -> Result<()> {
+        let cancel_token = CancellationToken::new();
+        let cancel_token_clone = cancel_token.clone();
+
         let session_config = self.session_file.as_ref().map(|s| {
             let session_id = session::Identifier::Path(s.clone());
             SessionConfig {
                 id: session_id.clone(),
-                working_dir: std::env::current_dir()
-                    .expect("failed to get current session working directory"),
+                working_dir: std::env::current_dir().unwrap_or_default(),
                 schedule_id: self.scheduled_job_id.clone(),
                 execution_mode: None,
                 max_turns: self.max_turns,
+                retry_config: self.retry_config.clone(),
             }
         });
         let mut stream = self
             .agent
-            .reply(&self.messages, session_config.clone())
+            .reply(&self.messages, session_config.clone(), Some(cancel_token))
             .await?;
 
         let mut progress_bars = output::McpSpinners::new();
@@ -882,15 +905,17 @@ impl Session {
                                     ));
                                     push_message(&mut self.messages, response_message);
                                     if let Some(session_file) = &self.session_file {
+                                        let working_dir = std::env::current_dir().ok();
                                         session::persist_messages_with_schedule_id(
                                             session_file,
                                             &self.messages,
                                             None,
                                             self.scheduled_job_id.clone(),
+                                            working_dir,
                                         )
                                         .await?;
                                     }
-
+                                    cancel_token_clone.cancel();
                                     drop(stream);
                                     break;
                                 } else {
@@ -972,6 +997,7 @@ impl Session {
                                     .reply(
                                         &self.messages,
                                         session_config.clone(),
+                                        None
                                     )
                                     .await?;
                             }
@@ -981,11 +1007,13 @@ impl Session {
 
                                 // No need to update description on assistant messages
                                 if let Some(session_file) = &self.session_file {
+                                    let working_dir = std::env::current_dir().ok();
                                     session::persist_messages_with_schedule_id(
                                         session_file,
                                         &self.messages,
                                         None,
                                         self.scheduled_job_id.clone(),
+                                        working_dir,
                                     )
                                     .await?;
                                 }
@@ -996,111 +1024,115 @@ impl Session {
                             }
                         }
                         Some(Ok(AgentEvent::McpNotification((_id, message)))) => {
-                                if let JsonRpcMessage::Notification(JsonRpcNotification{
-                                    method,
-                                    params: Some(Value::Object(o)),
-                                    ..
-                                }) = message {
-                                match method.as_str() {
-                                    "notifications/message" => {
-                                        let data = o.get("data").unwrap_or(&Value::Null);
-                                        let (formatted_message, subagent_id, _notification_type) = match data {
-                                            Value::String(s) => (s.clone(), None, None),
-                                            Value::Object(o) => {
-                                                // Check for subagent notification structure first
-                                                if let Some(Value::String(msg)) = o.get("message") {
-                                                    // Extract subagent info for better display
-                                                    let subagent_id = o.get("subagent_id")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("unknown");
-                                                    let notification_type = o.get("type")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("");
+                            match &message {
+                                ServerNotification::LoggingMessageNotification(notification) => {
+                                    let data = &notification.params.data;
+                                    let (formatted_message, subagent_id, message_notification_type) = match data {
+                                        Value::String(s) => (s.clone(), None, None),
+                                        Value::Object(o) => {
+                                            // Check for subagent notification structure first
+                                            if let Some(Value::String(msg)) = o.get("message") {
+                                                // Extract subagent info for better display
+                                                let subagent_id = o.get("subagent_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown");
+                                                let notification_type = o.get("type")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
 
-                                                    let formatted = match notification_type {
-                                                        "subagent_created" | "completed" | "terminated" => {
-                                                            format!("🤖 {}", msg)
-                                                        }
-                                                        "tool_usage" | "tool_completed" | "tool_error" => {
-                                                            format!("🔧 {}", msg)
-                                                        }
-                                                        "message_processing" | "turn_progress" => {
-                                                            format!("💭 {}", msg)
-                                                        }
-                                                        "response_generated" => {
-                                                            // Check verbosity setting for subagent response content
-                                                            let config = Config::global();
-                                                            let min_priority = config
-                                                                .get_param::<f32>("GOOSE_CLI_MIN_PRIORITY")
-                                                                .ok()
-                                                                .unwrap_or(0.5);
+                                                let formatted = match notification_type {
+                                                    "subagent_created" | "completed" | "terminated" => {
+                                                        format!("🤖 {}", msg)
+                                                    }
+                                                    "tool_usage" | "tool_completed" | "tool_error" => {
+                                                        format!("🔧 {}", msg)
+                                                    }
+                                                    "message_processing" | "turn_progress" => {
+                                                        format!("💭 {}", msg)
+                                                    }
+                                                    "response_generated" => {
+                                                        // Check verbosity setting for subagent response content
+                                                        let config = Config::global();
+                                                        let min_priority = config
+                                                            .get_param::<f32>("GOOSE_CLI_MIN_PRIORITY")
+                                                            .ok()
+                                                            .unwrap_or(0.5);
 
-                                                            if min_priority > 0.1 && !self.debug {
-                                                                // High/Medium verbosity: show truncated response
-                                                                if let Some(response_content) = msg.strip_prefix("Responded: ") {
-                                                                    format!("🤖 Responded: {}", safe_truncate(response_content, 100))
-                                                                } else {
-                                                                    format!("🤖 {}", msg)
-                                                                }
+                                                        if min_priority > 0.1 && !self.debug {
+                                                            // High/Medium verbosity: show truncated response
+                                                            if let Some(response_content) = msg.strip_prefix("Responded: ") {
+                                                                format!("🤖 Responded: {}", safe_truncate(response_content, 100))
                                                             } else {
-                                                                // All verbosity or debug: show full response
                                                                 format!("🤖 {}", msg)
                                                             }
+                                                        } else {
+                                                            // All verbosity or debug: show full response
+                                                            format!("🤖 {}", msg)
                                                         }
-                                                        _ => {
-                                                            msg.to_string()
-                                                        }
-                                                    };
-                                                    (formatted, Some(subagent_id.to_string()), Some(notification_type.to_string()))
-                                                } else if let Some(Value::String(output)) = o.get("output") {
-                                                    // Fallback for other MCP notification types
-                                                    (output.to_owned(), None, None)
-                                                } else {
-                                                    (data.to_string(), None, None)
-                                                }
-                                            },
-                                            v => {
-                                                (v.to_string(), None, None)
-                                            },
-                                        };
+                                                    }
+                                                    _ => {
+                                                        msg.to_string()
+                                                    }
+                                                };
+                                                (formatted, Some(subagent_id.to_string()), Some(notification_type.to_string()))
+                                            } else if let Some(Value::String(output)) = o.get("output") {
+                                                // Fallback for other MCP notification types
+                                                (output.to_owned(), None, None)
+                                            } else if let Some(result) = format_task_execution_notification(data) {
+                                                result
+                                            } else {
+                                                (data.to_string(), None, None)
+                                            }
+                                        },
+                                        v => {
+                                            (v.to_string(), None, None)
+                                        },
+                                    };
 
-                                        // Handle subagent notifications - show immediately
-                                        if let Some(_id) = subagent_id {
-                                            // Show subagent notifications immediately (no buffering) with compact spacing
-                                            if interactive {
-                                                let _ = progress_bars.hide();
-                                                println!("{}", console::style(&formatted_message).green().dim());
-                                            } else {
-                                                progress_bars.log(&formatted_message);
-                                            }
+                                    // Handle subagent notifications - show immediately
+                                    if let Some(_id) = subagent_id {
+                                        // TODO: proper display for subagent notifications
+                                        if interactive {
+                                            let _ = progress_bars.hide();
+                                            println!("{}", console::style(&formatted_message).green().dim());
                                         } else {
-                                            // Non-subagent notification, display immediately with compact spacing
+                                            progress_bars.log(&formatted_message);
+                                        }
+                                    } else if let Some(ref notification_type) = message_notification_type {
+                                        if notification_type == TASK_EXECUTION_NOTIFICATION_TYPE {
                                             if interactive {
                                                 let _ = progress_bars.hide();
-                                                println!("{}", console::style(&formatted_message).green().dim());
+                                                print!("{}", formatted_message);
+                                                std::io::stdout().flush().unwrap();
                                             } else {
-                                                progress_bars.log(&formatted_message);
+                                                print!("{}", formatted_message);
+                                                std::io::stdout().flush().unwrap();
                                             }
                                         }
-                                    },
-                                    "notifications/progress" => {
-                                        let progress = o.get("progress").and_then(|v| v.as_f64());
-                                        let token = o.get("progressToken").map(|v| v.to_string());
-                                        let message = o.get("message").and_then(|v| v.as_str());
-                                        let total = o
-                                            .get("total")
-                                            .and_then(|v| v.as_f64());
-                                        if let (Some(progress), Some(token)) = (progress, token) {
-                                            progress_bars.update(
-                                                token.as_str(),
-                                                progress,
-                                                total,
-                                                message,
-                                            );
+                                    }
+                                    else {
+                                        // Non-subagent notification, display immediately with compact spacing
+                                        if interactive {
+                                            let _ = progress_bars.hide();
+                                            println!("{}", console::style(&formatted_message).green().dim());
+                                        } else {
+                                            progress_bars.log(&formatted_message);
                                         }
-                                    },
-                                    _ => (),
-                                }
+                                    }
+                                },
+                                ServerNotification::ProgressNotification(notification) => {
+                                    let progress = notification.params.progress;
+                                    let text = notification.params.message.as_deref();
+                                    let total = notification.params.total;
+                                    let token = &notification.params.progress_token;
+                                    progress_bars.update(
+                                        &token.0.to_string(),
+                                        progress,
+                                        total,
+                                        text,
+                                    );
+                                },
+                                _ => (),
                             }
                         }
                         Some(Ok(AgentEvent::ModelChange { model, mode })) => {
@@ -1112,6 +1144,7 @@ impl Session {
 
                         Some(Err(e)) => {
                             eprintln!("Error: {}", e);
+                            cancel_token_clone.cancel();
                             drop(stream);
                             if let Err(e) = self.handle_interrupted_messages(false).await {
                                 eprintln!("Error handling interruption: {}", e);
@@ -1128,6 +1161,7 @@ impl Session {
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
+                    cancel_token_clone.cancel();
                     drop(stream);
                     if let Err(e) = self.handle_interrupted_messages(true).await {
                         eprintln!("Error handling interruption: {}", e);
@@ -1146,7 +1180,7 @@ impl Session {
         let tool_requests = self
             .messages
             .last()
-            .filter(|msg| msg.role == mcp_core::role::Role::Assistant)
+            .filter(|msg| msg.role == rmcp::model::Role::Assistant)
             .map_or(Vec::new(), |msg| {
                 msg.content
                     .iter()
@@ -1184,11 +1218,13 @@ impl Session {
 
             // No need for description update here
             if let Some(session_file) = &self.session_file {
+                let working_dir = std::env::current_dir().ok();
                 session::persist_messages_with_schedule_id(
                     session_file,
                     &self.messages,
                     None,
                     self.scheduled_job_id.clone(),
+                    working_dir,
                 )
                 .await?;
             }
@@ -1201,11 +1237,13 @@ impl Session {
 
             // No need for description update here
             if let Some(session_file) = &self.session_file {
+                let working_dir = std::env::current_dir().ok();
                 session::persist_messages_with_schedule_id(
                     session_file,
                     &self.messages,
                     None,
                     self.scheduled_job_id.clone(),
+                    working_dir,
                 )
                 .await?;
             }
@@ -1214,7 +1252,7 @@ impl Session {
         } else {
             // An interruption occurred outside of a tool request-response.
             if let Some(last_msg) = self.messages.last() {
-                if last_msg.role == mcp_core::role::Role::User {
+                if last_msg.role == rmcp::model::Role::User {
                     match last_msg.content.first() {
                         Some(MessageContent::ToolResponse(_)) => {
                             // Interruption occurred after a tool had completed but not assistant reply
@@ -1223,11 +1261,13 @@ impl Session {
 
                             // No need for description update here
                             if let Some(session_file) = &self.session_file {
+                                let working_dir = std::env::current_dir().ok();
                                 session::persist_messages_with_schedule_id(
                                     session_file,
                                     &self.messages,
                                     None,
                                     self.scheduled_job_id.clone(),
+                                    working_dir,
                                 )
                                 .await?;
                             }
@@ -1417,9 +1457,9 @@ impl Session {
                         let msg = Message::from(prompt_message);
                         // ensure we get a User - Assistant - User type pattern
                         let expected_role = if i % 2 == 0 {
-                            mcp_core::Role::User
+                            rmcp::model::Role::User
                         } else {
-                            mcp_core::Role::Assistant
+                            rmcp::model::Role::Assistant
                         };
 
                         if msg.role != expected_role {
@@ -1433,7 +1473,7 @@ impl Session {
                             break;
                         }
 
-                        if msg.role == mcp_core::Role::User {
+                        if msg.role == rmcp::model::Role::User {
                             output::render_message(&msg, self.debug);
                         }
                         self.push_message(msg);
