@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -18,9 +17,6 @@ use crate::transport::TransportMessageRecv;
 
 use super::{serialize_and_send, Error, Transport, TransportHandle};
 
-// Global to track process groups we've created
-static PROCESS_GROUP: AtomicI32 = AtomicI32::new(-1);
-
 /// A `StdioTransport` uses a child process's stdin/stdout as a communication channel.
 ///
 /// It uses channels for message passing and handles responses asynchronously through a background task.
@@ -32,21 +28,21 @@ pub struct StdioActor {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
+    #[cfg(unix)]
+    pgid: Option<i32>, // Process group ID for cleanup
 }
 
 impl Drop for StdioActor {
     fn drop(&mut self) {
-        // Get the process group ID before attempting cleanup
         #[cfg(unix)]
-        if let Some(pid) = self.process.id() {
-            if let Ok(pgid) = getpgid(Some(Pid::from_raw(pid as i32))) {
-                // Send SIGTERM to the entire process group
-                let _ = kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGTERM);
-                // Give processes a moment to cleanup
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                // Force kill if still running
-                let _ = kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGKILL);
-            }
+        if let Some(pgid) = self.pgid {
+            // Send SIGTERM to the entire process group
+            let _ = kill(Pid::from_raw(-pgid), Signal::SIGTERM);
+            // Note: std::thread::sleep is blocking, but this is a Drop impl.
+            // For graceful async shutdown, use the `close` method on `StdioTransport`.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Force kill if still running
+            let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
         }
     }
 }
@@ -209,7 +205,7 @@ impl StdioTransport {
         }
     }
 
-    async fn spawn_process(&self) -> Result<(Child, ChildStdin, ChildStdout, ChildStderr), Error> {
+    async fn spawn_process(&self) -> Result<(Child, ChildStdin, ChildStdout, ChildStderr, Option<i32>), Error> {
         let mut command = Command::new(&self.command);
         command
             .envs(&self.env)
@@ -259,16 +255,16 @@ impl StdioTransport {
             .take()
             .ok_or_else(|| Error::StdioProcessError("Failed to get stderr".into()))?;
 
+        let mut pgid = None;
         // Store the process group ID for cleanup
         #[cfg(unix)]
         if let Some(pid) = process.id() {
-            // Use nix instead of unsafe libc calls
-            if let Ok(pgid) = getpgid(Some(Pid::from_raw(pid as i32))) {
-                PROCESS_GROUP.store(pgid.as_raw(), Ordering::SeqCst);
+            if let Ok(id) = getpgid(Some(Pid::from_raw(pid as i32))) {
+                pgid = Some(id.as_raw());
             }
         }
 
-        Ok((process, stdin, stdout, stderr))
+        Ok((process, stdin, stdout, stderr, pgid))
     }
 }
 
@@ -277,7 +273,7 @@ impl Transport for StdioTransport {
     type Handle = StdioTransportHandle;
 
     async fn start(&self) -> Result<Self::Handle, Error> {
-        let (process, stdin, stdout, stderr) = self.spawn_process().await?;
+        let (process, stdin, stdout, stderr, pgid) = self.spawn_process().await?;
         let (outbox_tx, outbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(32);
         let (error_tx, error_rx) = mpsc::channel(1);
@@ -290,6 +286,8 @@ impl Transport for StdioTransport {
             stdin: Some(stdin),
             stdout: Some(stdout),
             stderr: Some(stderr),
+            #[cfg(unix)]
+            pgid, // Pass the pgid to the actor
         };
 
         tokio::spawn(actor.run());
@@ -303,17 +301,8 @@ impl Transport for StdioTransport {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        // Attempt to clean up the process group on close
-        #[cfg(unix)]
-        if let Some(pgid) = PROCESS_GROUP.load(Ordering::SeqCst).checked_abs() {
-            // Use nix instead of unsafe libc calls
-            // Try SIGTERM first
-            let _ = kill(Pid::from_raw(-pgid), Signal::SIGTERM);
-            // Give processes a moment to cleanup
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            // Force kill if still running
-            let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
-        }
+        // The StdioActor's Drop implementation handles process termination.
+        // This method can be a no-op for now.
         Ok(())
     }
 }
