@@ -8,6 +8,7 @@ goose = { path = "../goose" }
 goose-mcp = { path = "../goose-mcp" }
 mcp-client = { path = "../mcp-client" }
 mcp-core = { path = "../mcp-core" }
+mcp-server = { path = "../mcp-server" }
 tokio = { version = "1", features = ["full"] }
 warp = "0.3"
 serde = { version = "1", features = ["derive"] }

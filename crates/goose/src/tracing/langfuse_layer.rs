@@ -187,7 +187,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
-    use serial_test::serial;
     use tokio::sync::Mutex;
     use tracing::dispatcher;
     use wiremock::matchers::{method, path};
@@ -390,7 +389,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_create_langfuse_observer() {
         let fixture = TestFixture::new().await.with_mock_server().await;
 

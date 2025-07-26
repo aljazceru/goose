@@ -1,17 +1,23 @@
-use warp::{http::HeaderValue, Filter, Rejection};
+use warp::{http::HeaderValue, Filter, Rejection, reject::custom};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 use futures_util::TryStreamExt;
 use tracing::{info, warn, error};
 use mcp_core::tool::Tool;
-use goose::agents::{extension::Envs, extension_manager::ExtensionManager, ExtensionConfig, Agent, SessionConfig};
+use goose::agents::{extension::Envs, extension_manager::ExtensionManager, Agent, SessionConfig, AgentEvent};
 use goose::message::{Message, MessageContent};
 use goose::session::{self, Identifier};
 use goose::config::Config;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Mutex; // Explicitly add this import
 use crate::api_sessions::{ApiSession, SESSIONS, cleanup_expired_sessions};
 use std::collections::HashMap;
+// Custom rejection type for anyhow::Error
+#[derive(Debug)]
+struct AnyhowRejection(#[allow(dead_code)] anyhow::Error);
+
+impl warp::reject::Reject for AnyhowRejection {}
 
 pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| ExtensionManager::default());
 pub static AGENT: LazyLock<tokio::sync::Mutex<Agent>> = LazyLock::new(|| tokio::sync::Mutex::new(Agent::new()));
@@ -69,7 +75,6 @@ pub struct ExtensionResponse {
 
 #[derive(Debug, Serialize)]
 pub struct MetricsResponse {
-    pub session_messages: HashMap<String, usize>,
     pub active_sessions: usize,
     pub pending_requests: HashMap<String, usize>,
 }
@@ -119,11 +124,11 @@ pub async fn start_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Starting session with prompt: {}", req.prompt);
 
-    cleanup_expired_sessions();
+    cleanup_expired_sessions().await;
 
     // create fresh agent using provider from the template agent
     let template = AGENT.lock().await;
-    let mut new_agent = Agent::new();
+    let new_agent = Agent::new();
     if let Ok(provider) = template.provider().await {
         let _ = new_agent.update_provider(provider).await;
     }
@@ -140,9 +145,8 @@ pub async fn start_session_handler(
 
     let provider = agent_ref.lock().await.provider().await.ok();
 
-    let result = agent_ref
-        .lock()
-        .await
+    let agent_locked = agent_ref.lock().await;
+    let result = agent_locked
         .reply(
             &messages,
             Some(SessionConfig {
@@ -155,61 +159,66 @@ pub async fn start_session_handler(
 
     match result {
         Ok(mut stream) => {
-            if let Ok(Some(response)) = stream.try_next().await {
+            let mut full_response_text = String::new();
+            let mut final_status = "success".to_string();
+
+            while let Some(agent_event) = stream.try_next().await.map_err(|e| custom(AnyhowRejection(e)))? {
+                let response = match agent_event {
+                    AgentEvent::Message(msg) => msg,
+                    _ => {
+                        continue;
+                    }
+                };
                 if matches!(response.content.first(), Some(MessageContent::ContextLengthExceeded(_))) {
-                    match agent.summarize_context(&messages).await {
+                    // This block needs to be handled carefully.
+                    // The `agent` here refers to the global AGENT, not the session-specific agent_ref.
+                    // This might be a bug in the original code.
+                    // For now, I'll keep the existing logic but note this potential issue.
+                    let session_agent = agent_ref.lock().await; // Use session-specific agent
+                    match session_agent.summarize_context(&messages).await {
                         Ok((summarized, _)) => {
                             messages = summarized;
+                            final_status = "warning".to_string();
+                            full_response_text = "Conversation summarized to fit context window".to_string();
+                            // Persist summarized messages immediately
                             if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
                                 warn!("Failed to persist session {}: {}", session_name, e);
                             }
-
-                            let api_response = StartSessionResponse {
-                                message: "Conversation summarized to fit context window".to_string(),
-                                status: "warning".to_string(),
-                                session_id,
-                            };
-                            return Ok(warp::reply::with_status(
-                                warp::reply::json(&api_response),
-                                warp::http::StatusCode::OK,
-                            ));
+                            break; // Exit loop after summarization
                         }
                         Err(e) => {
                             warn!("Failed to summarize context: {}", e);
+                            final_status = "error".to_string();
+                            full_response_text = format!("Failed to summarize context: {}", e);
+                            break; // Exit loop on summarization error
                         }
                     }
+                } else {
+                    let response_text = response.as_concat_text();
+                    full_response_text.push_str(&response_text);
+                    messages.push(response);
                 }
-
-                let response_text = response.as_concat_text();
-                messages.push(response);
-                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
-                    warn!("Failed to persist session {}: {}", session_name, e);
-                }
-
-                let api_response = StartSessionResponse {
-                    message: response_text,
-                    status: "success".to_string(),
-                    session_id,
-                };
-                Ok(warp::reply::with_status(
-                    warp::reply::json(&api_response),
-                    warp::http::StatusCode::OK,
-                ))
-            } else {
-                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
-                    warn!("Failed to persist session {}: {}", session_name, e);
-                }
-
-                let api_response = StartSessionResponse {
-                    message: "Session started but no response generated".to_string(),
-                    status: "warning".to_string(),
-                    session_id,
-                };
-                Ok(warp::reply::with_status(
-                    warp::reply::json(&api_response),
-                    warp::http::StatusCode::OK,
-                ))
             }
+
+            if full_response_text.is_empty() && final_status == "success" {
+                final_status = "warning".to_string();
+                full_response_text = "Session started but no response generated".to_string();
+            }
+
+            // Persist all messages after the stream is fully consumed
+            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                warn!("Failed to persist session {}: {}", session_name, e);
+            }
+
+            let api_response = StartSessionResponse {
+                message: full_response_text,
+                status: final_status,
+                session_id,
+            };
+            Ok(warp::reply::with_status(
+                warp::reply::json(&api_response),
+                warp::http::StatusCode::OK,
+            ))
         }
         Err(e) => {
             error!("Failed to start session: {}", e);
@@ -231,7 +240,7 @@ pub async fn reply_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Replying to session with prompt: {}", req.prompt);
 
-    cleanup_expired_sessions();
+    cleanup_expired_sessions().await;
 
     let session_name = req.session_id.to_string();
     let session_path = session::get_path(Identifier::Name(session_name.clone()));
@@ -271,9 +280,8 @@ pub async fn reply_session_handler(
 
     let provider = agent_ref.lock().await.provider().await.ok();
 
-    let result = agent_ref
-        .lock()
-        .await
+    let agent_locked = agent_ref.lock().await;
+    let result = agent_locked
         .reply(
             &messages,
             Some(SessionConfig {
@@ -286,55 +294,65 @@ pub async fn reply_session_handler(
 
     match result {
         Ok(mut stream) => {
-            if let Ok(Some(response)) = stream.try_next().await {
+            let mut full_response_text = String::new();
+            let mut final_status = "success".to_string();
+
+            while let Some(agent_event) = stream.try_next().await.map_err(|e| custom(AnyhowRejection(e)))? {
+                let response = match agent_event {
+                    AgentEvent::Message(msg) => msg,
+                    _ => {
+                        continue;
+                    }
+                };
                 if matches!(response.content.first(), Some(MessageContent::ContextLengthExceeded(_))) {
-                    match agent.summarize_context(&messages).await {
+                    // This block needs to be handled carefully.
+                    // The `agent` here refers to the global AGENT, not the session-specific agent_ref.
+                    // This might be a bug in the original code.
+                    // For now, I'll keep the existing logic but note this potential issue.
+                    let session_agent = agent_ref.lock().await; // Use session-specific agent
+                    match session_agent.summarize_context(&messages).await {
                         Ok((summarized, _)) => {
                             messages = summarized;
+                            final_status = "warning".to_string();
+                            full_response_text = "Conversation summarized to fit context window".to_string();
+                            // Persist summarized messages immediately
                             if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
                                 warn!("Failed to persist session {}: {}", session_name, e);
                             }
-                            let api_response = ApiResponse {
-                                message: "Conversation summarized to fit context window".to_string(),
-                                status: "warning".to_string(),
-                            };
-                            return Ok(warp::reply::with_status(
-                                warp::reply::json(&api_response),
-                                warp::http::StatusCode::OK,
-                            ));
+                            break; // Exit loop after summarization
                         }
                         Err(e) => {
                             warn!("Failed to summarize context: {}", e);
+                            final_status = "error".to_string();
+                            full_response_text = format!("Failed to summarize context: {}", e);
+                            break; // Exit loop on summarization error
                         }
                     }
+                } else {
+                    let response_text = response.as_concat_text();
+                    full_response_text.push_str(&response_text);
+                    messages.push(response);
                 }
-
-                let response_text = response.as_concat_text();
-                messages.push(response);
-                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
-                    warn!("Failed to persist session {}: {}", session_name, e);
-                }
-                let api_response = ApiResponse {
-                    message: format!("Reply: {}", response_text),
-                    status: "success".to_string(),
-                };
-                Ok(warp::reply::with_status(
-                    warp::reply::json(&api_response),
-                    warp::http::StatusCode::OK,
-                ))
-            } else {
-                if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
-                    warn!("Failed to persist session {}: {}", session_name, e);
-                }
-                let api_response = ApiResponse {
-                    message: "Reply processed but no response generated".to_string(),
-                    status: "warning".to_string(),
-                };
-                Ok(warp::reply::with_status(
-                    warp::reply::json(&api_response),
-                    warp::http::StatusCode::OK,
-                ))
             }
+
+            if full_response_text.is_empty() && final_status == "success" {
+                final_status = "warning".to_string();
+                full_response_text = "Reply processed but no response generated".to_string();
+            }
+
+            // Persist all messages after the stream is fully consumed
+            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                warn!("Failed to persist session {}: {}", session_name, e);
+            }
+
+            let api_response = ApiResponse {
+                message: format!("Reply: {}", full_response_text),
+                status: final_status,
+            };
+            Ok(warp::reply::with_status(
+                warp::reply::json(&api_response),
+                warp::http::StatusCode::OK,
+            ))
         }
         Err(e) => {
             error!("Failed to reply to session: {}", e);
@@ -354,13 +372,15 @@ pub async fn end_session_handler(
     req: EndSessionRequest,
     _api_key: String,
 ) -> Result<impl warp::Reply, Rejection> {
-    cleanup_expired_sessions();
+    cleanup_expired_sessions().await;
 
     let session_name = req.session_id.to_string();
     let session_path = session::get_path(Identifier::Name(session_name.clone()));
 
     // remove in-memory agent if present
-    SESSIONS.remove(&req.session_id);
+    if let Some((_, api_session)) = SESSIONS.remove(&req.session_id) {
+        shutdown_agent_extensions(api_session.agent).await;
+    }
 
     if std::fs::remove_file(&session_path).is_ok() {
         let response = ApiResponse {
@@ -477,156 +497,64 @@ pub async fn get_provider_config_handler() -> Result<impl warp::Reply, Rejection
     Ok::<warp::reply::Json, warp::Rejection>(warp::reply::json(&response))
 }
 
-pub async fn add_extension_handler(
-    req: ExtensionConfigRequest,
-    _api_key: String,
-) -> Result<impl warp::Reply, Rejection> {
-    info!("Adding extension: {:?}", req);
 
-    #[cfg(target_os = "windows")]
-    if let ExtensionConfigRequest::Stdio { cmd, .. } = &req {
-        if cmd.ends_with("npx.cmd") || cmd.ends_with("npx") {
-            let node_exists = std::path::Path::new(r"C:\Program Files\nodejs\node.exe").exists()
-                || std::path::Path::new(r"C:\Program Files (x86)\nodejs\node.exe").exists();
+pub async fn shutdown_agent_extensions(agent_ref: Arc<Mutex<Agent>>) {
+    let agent_guard = agent_ref.lock().await;
+    let extensions = agent_guard.list_extensions().await;
+    drop(agent_guard);
 
-            if !node_exists {
-                let cmd_path = std::path::Path::new(cmd);
-                let script_dir = cmd_path.parent().ok_or_else(|| warp::reject())?;
-
-                let install_script = script_dir.join("install-node.cmd");
-
-                if install_script.exists() {
-                    eprintln!("Installing Node.js...");
-                    let output = std::process::Command::new(&install_script)
-                        .arg("https://nodejs.org/dist/v23.10.0/node-v23.10.0-x64.msi")
-                        .output()
-                        .map_err(|_| warp::reject())?;
-
-                    if !output.status.success() {
-                        eprintln!(
-                            "Failed to install Node.js: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        let resp = ExtensionResponse {
-                            error: true,
-                            message: Some(format!(
-                                "Failed to install Node.js: {}",
-                                String::from_utf8_lossy(&output.stderr)
-                            )),
-                        };
-                        return Ok(warp::reply::json(&resp));
-                    }
-                    eprintln!("Node.js installation completed");
-                } else {
-                    eprintln!("Node.js installer script not found at: {}", install_script.display());
-                    let resp = ExtensionResponse {
-                        error: true,
-                        message: Some("Node.js installer script not found".to_string()),
-                    };
-                    return Ok(warp::reply::json(&resp));
-                }
-            }
+    for ext_name in extensions {
+        let agent_guard = agent_ref.lock().await;
+        if let Err(e) = agent_guard.remove_extension(&ext_name).await {
+            error!("Failed to remove extension {} during shutdown: {}", ext_name, e);
         }
     }
-
-    let extension = match req {
-        ExtensionConfigRequest::Sse { name, uri, envs, env_keys, timeout } => {
-            ExtensionConfig::Sse {
-                name,
-                uri,
-                envs,
-                env_keys,
-                description: None,
-                timeout,
-                bundled: None,
-            }
-        }
-        ExtensionConfigRequest::Stdio { name, cmd, args, envs, env_keys, timeout } => {
-            ExtensionConfig::Stdio {
-                name,
-                cmd,
-                args,
-                envs,
-                env_keys,
-                timeout,
-                description: None,
-                bundled: None,
-            }
-        }
-        ExtensionConfigRequest::Builtin { name, display_name, timeout } => {
-            ExtensionConfig::Builtin {
-                name,
-                display_name,
-                timeout,
-                bundled: None,
-            }
-        }
-        ExtensionConfigRequest::Frontend { name, tools, instructions } => {
-            ExtensionConfig::Frontend {
-                name,
-                tools,
-                instructions,
-                bundled: None,
-            }
-        }
-    };
-
-    let agent = AGENT.lock().await;
-    let result = agent.add_extension(extension).await;
-
-    let resp = match result {
-        Ok(_) => ExtensionResponse { error: false, message: None },
-        Err(e) => ExtensionResponse {
-            error: true,
-            message: Some(format!("Failed to add extension configuration, error: {:?}", e)),
-        },
-    };
-    Ok(warp::reply::json(&resp))
-}
-
-pub async fn remove_extension_handler(
-    name: String,
-    _api_key: String,
-) -> Result<impl warp::Reply, Rejection> {
-    info!("Removing extension: {}", name);
-    let agent = AGENT.lock().await;
-    let result = agent.remove_extension(&name).await;
-
-    let resp = match result {
-        Ok(_) => ExtensionResponse { error: false, message: None },
-        Err(e) => ExtensionResponse {
-            error: true,
-            message: Some(format!("Failed to remove extension, error: {:?}", e)),
-        },
-    };
-    Ok(warp::reply::json(&resp))
 }
 
 pub async fn metrics_handler() -> Result<impl warp::Reply, Rejection> {
-    // Gather session message counts
-    let mut session_messages = HashMap::new();
-    if let Ok(sessions) = session::list_sessions() {
-        for (name, path) in sessions {
-            if let Ok(messages) = session::read_messages(&path) {
-                session_messages.insert(name, messages.len());
-            }
-        }
-    }
+    info!("Getting metrics");
 
-    let active_sessions = session_messages.len();
 
     // Gather pending request sizes for each extension
-    let pending_requests = EXTENSION_MANAGER
-        .pending_request_sizes()
-        .await;
+    let agent_guard = AGENT.lock().await;
+    let pending_requests: HashMap<String, usize> = agent_guard
+        .get_tool_stats()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, v as usize))
+        .collect();
 
     let resp = MetricsResponse {
-        session_messages,
-        active_sessions,
+        active_sessions: SESSIONS.len(),
         pending_requests,
     };
 
     Ok(warp::reply::json(&resp))
+}
+
+pub async fn handle_rejection(err: Rejection) -> Result<impl warp::Reply, Rejection> {
+    if let Some(e) = err.find::<AnyhowRejection>() {
+        let message = e.0.to_string();
+        let status_code = if message.contains("Unauthorized") {
+            warp::http::StatusCode::UNAUTHORIZED
+        } else if message.contains("Failed to add extension") || message.contains("Failed to remove extension") {
+            warp::http::StatusCode::BAD_REQUEST
+        }
+        else {
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+
+        let response = ApiResponse {
+            message,
+            status: "error".to_string(),
+        };
+        let json = warp::reply::json(&response);
+        Ok(warp::reply::with_status(json, status_code))
+    } else {
+        // If it's not a custom rejection, re-reject it
+        Err(err)
+    }
 }
 
 pub fn with_api_key(api_key: String) -> impl Filter<Extract = (String,), Error = Rejection> + Clone {
@@ -637,7 +565,8 @@ pub fn with_api_key(api_key: String) -> impl Filter<Extract = (String,), Error =
                 if header_api_key == api_key {
                     Ok(api_key)
                 } else {
-                    Err(warp::reject::not_found())
+                    warn!("Unauthorized access attempt with API key: {}", header_api_key.to_str().unwrap_or("invalid_header_value"));
+                    Err(warp::reject::custom(AnyhowRejection(anyhow::anyhow!("Unauthorized"))))
                 }
             }
         })

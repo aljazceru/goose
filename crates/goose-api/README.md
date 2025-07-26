@@ -287,8 +287,15 @@ By default, the server runs on `127.0.0.1:8080`. You can modify this using confi
 
 Sessions created via the API are stored in the same location as the CLI
 (`~/.local/share/goose/sessions` on most platforms). Each session is saved to a
-`<session_id>.jsonl` file. You can resume or inspect these sessions with the CLI
-by providing the session ID returned from the API.
+`<session_id>.jsonl` file.
+
+You can resume or inspect these sessions with the CLI by providing the session ID
+(which is a UUID) returned from the API. For example, if the API returns a
+`session_id` of `a1b2c3d4-e5f6-7890-1234-567890abcdef`, you can resume it with:
+
+```bash
+goose session --resume --name a1b2c3d4-e5f6-7890-1234-567890abcdef
+```
 
 ## Examples
 
@@ -298,7 +305,7 @@ by providing the session ID returned from the API.
 # Start a session
 curl -X POST http://localhost:8080/session/start \
   -H "Content-Type: application/json" \
-  -H "x-api-key: your_secure_api_key" \
+  -H "x-api-key: kurac" \
   -d '{"prompt": "Create a Python function to generate Fibonacci numbers"}'
 
 # Reply to an ongoing session

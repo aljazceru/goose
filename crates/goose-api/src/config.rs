@@ -137,6 +137,21 @@ pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
 }
 
 pub async fn initialize_extensions(config: &config::Config) -> Result<(), anyhow::Error> {
+    let agent = AGENT.lock().await;
+
+    // First, remove any existing extensions from a previous run (if any)
+    let existing_extensions = agent.list_extensions().await;
+    drop(agent); // Release lock before async calls
+
+    for ext_name in existing_extensions {
+        let agent_guard = AGENT.lock().await;
+        if let Err(e) = agent_guard.remove_extension(&ext_name).await {
+            error!("Failed to remove existing extension {} during initialization cleanup: {}", ext_name, e);
+        }
+    }
+
+    // Now, proceed with adding extensions from the config
+    let agent = AGENT.lock().await; // Re-acquire lock
     if let Ok(ext_table) = config.get_table("extensions") {
         for (name, ext_config) in ext_table {
             let entry: ExtensionEntry = ext_config.clone().try_deserialize()
@@ -144,7 +159,6 @@ pub async fn initialize_extensions(config: &config::Config) -> Result<(), anyhow
 
             if entry.enabled {
                 let extension_config: ExtensionConfig = entry.config;
-                let agent = AGENT.lock().await;
                 if let Err(e) = agent.add_extension(extension_config).await {
                     error!("Failed to add extension {}: {}", name, e);
                 }
