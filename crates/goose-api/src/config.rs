@@ -1,11 +1,15 @@
-use crate::handlers::AGENT;
 use goose::config::{Config, ExtensionEntry};
 use goose::agents::ExtensionConfig;
-use goose::providers::{create, providers};
-use goose::model::ModelConfig;
+use goose::providers::providers;
 use tracing::{info, warn, error};
 use config::{builder::DefaultState, ConfigBuilder, Environment, File};
 use serde_json::Value;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::RwLock;
+
+pub static PROVIDER_CONFIG: LazyLock<Arc<RwLock<Option<ProviderConfig>>>> = LazyLock::new(|| {
+    Arc::new(RwLock::new(None))
+});
 
 pub fn load_configuration() -> std::result::Result<config::Config, config::ConfigError> {
     // Determine the configuration file based on priority:
@@ -31,7 +35,14 @@ pub fn load_configuration() -> std::result::Result<config::Config, config::Confi
     builder.build()
 }
 
-pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
+#[derive(Clone, Debug)]
+pub struct ProviderConfig {
+    pub provider_name: String,
+    pub model_name: String,
+}
+
+pub async fn load_provider_config() -> Result<ProviderConfig, anyhow::Error> {
+    eprintln!("[DEBUG] Starting initialize_provider_config");
     let api_config = load_configuration()?;
 
     let global_config = Config::global();
@@ -61,6 +72,7 @@ pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
     };
 
     info!("Initializing with provider: {}, model: {}", provider_name, model_name);
+    eprintln!("[DEBUG] Provider: {}, Model: {}", provider_name, model_name);
 
     let config = Config::global();
     config.set_param("GOOSE_PROVIDER", Value::String(provider_name.clone()))?;
@@ -126,58 +138,29 @@ pub async fn initialize_provider_config() -> Result<(), anyhow::Error> {
         }
     }
 
-    let model_config = ModelConfig::new(model_name);
-    let provider = create(&provider_name, model_config)?;
-
-    let agent = AGENT.lock().await;
-    agent.update_provider(provider).await?;
-
-    info!("Provider configuration successful");
-    Ok(())
+    Ok(ProviderConfig {
+        provider_name: provider_name.clone(),
+        model_name: model_name.clone(),
+    })
 }
 
-pub async fn initialize_extensions(config: &config::Config) -> Result<(), anyhow::Error> {
-    let agent = AGENT.lock().await;
-
-    // First, remove any existing extensions from a previous run (if any)
-    let existing_extensions = agent.list_extensions().await;
-    drop(agent); // Release lock before async calls
-
-    for ext_name in existing_extensions {
-        let agent_guard = AGENT.lock().await;
-        if let Err(e) = agent_guard.remove_extension(&ext_name).await {
-            error!("Failed to remove existing extension {} during initialization cleanup: {}", ext_name, e);
-        }
-    }
-
-    // Now, proceed with adding extensions from the config
-    let agent = AGENT.lock().await; // Re-acquire lock
+pub fn load_extensions_config(config: &config::Config) -> Vec<(String, ExtensionConfig)> {
+    let mut extensions = Vec::new();
+    
     if let Ok(ext_table) = config.get_table("extensions") {
         for (name, ext_config) in ext_table {
-            let entry: ExtensionEntry = ext_config.clone().try_deserialize()
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize extension config for {}: {}", name, e))?;
-
-            if entry.enabled {
-                let extension_config: ExtensionConfig = entry.config;
-                if let Err(e) = agent.add_extension(extension_config).await {
-                    error!("Failed to add extension {}: {}", name, e);
+            match ext_config.clone().try_deserialize::<ExtensionEntry>() {
+                Ok(entry) if entry.enabled => {
+                    extensions.push((name.clone(), entry.config));
                 }
-            } else {
-                info!("Skipping disabled extension: {}", name);
+                Ok(_) => info!("Skipping disabled extension: {}", name),
+                Err(e) => error!("Failed to deserialize extension config for {}: {}", name, e),
             }
         }
     } else {
         warn!("No extensions configured in config file.");
     }
-    Ok(())
+    
+    extensions
 }
 
-pub async fn run_init_tests() -> Result<(), anyhow::Error> {
-    info!("Running initialization tests");
-    {
-        let _agent = AGENT.lock().await;
-        info!("Agent initialization test passed");
-    }
-    info!("Initialization tests completed");
-    Ok(())
-}

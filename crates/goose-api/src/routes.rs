@@ -1,5 +1,5 @@
 use warp::Filter;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 use crate::handlers::{
     end_session_handler, get_provider_config_handler, handle_rejection,
@@ -7,8 +7,7 @@ use crate::handlers::{
     start_session_handler, summarize_session_handler, with_api_key,
 };
 use crate::config::{
-    initialize_provider_config, load_configuration,
-    run_init_tests,
+    load_provider_config, load_configuration,
 };
 
 pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
@@ -66,6 +65,7 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
 }
 
 pub async fn run_server() -> Result<(), anyhow::Error> {
+    
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -91,15 +91,17 @@ pub async fn run_server() -> Result<(), anyhow::Error> {
         });
     info!("Using API key: {}", api_key);
 
-    if let Err(e) = initialize_provider_config().await {
-        error!("Failed to initialize provider: {}", e);
-        return Err(e);
+    // Load provider config but don't initialize a global agent
+    let provider_config = load_provider_config().await?;
+    info!("Provider config loaded: {} with model {}", provider_config.provider_name, provider_config.model_name);
+    
+    // Store provider config globally
+    {
+        use crate::config::PROVIDER_CONFIG;
+        let mut config_guard = PROVIDER_CONFIG.write().await;
+        *config_guard = Some(provider_config.clone());
     }
-
-
-    if let Err(e) = run_init_tests().await {
-        error!("Initialization tests failed: {}", e);
-    }
+    
 
     let routes = build_routes(api_key.clone());
 
@@ -128,21 +130,25 @@ pub async fn run_server() -> Result<(), anyhow::Error> {
         tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
         info!("Received Ctrl+C, initiating graceful shutdown...");
 
-        // Perform cleanup here
-        use crate::handlers::AGENT; // Import AGENT from handlers
-        use tracing::error; // Import error for logging
-
-        let agent_guard = AGENT.lock().await;
-        let extensions = agent_guard.list_extensions().await;
-        drop(agent_guard); // Release lock before async calls
-
-        for ext_name in extensions {
-            let agent_guard = AGENT.lock().await;
-            if let Err(e) = agent_guard.remove_extension(&ext_name).await {
-                error!("Failed to remove extension {} during graceful shutdown: {}", ext_name, e);
-            }
+        // Perform cleanup here - shutdown all active sessions
+        use crate::api_sessions::SESSIONS;
+        use crate::handlers::shutdown_agent_extensions;
+        
+        info!("Shutting down {} active sessions", SESSIONS.len());
+        
+        // Collect all sessions to avoid holding locks
+        let sessions_to_shutdown: Vec<_> = SESSIONS.iter()
+            .map(|entry| (entry.key().clone(), entry.value().agent.clone()))
+            .collect();
+        
+        // Shutdown each session's extensions
+        for (session_id, agent) in sessions_to_shutdown {
+            info!("Shutting down session {}", session_id);
+            shutdown_agent_extensions(agent).await;
+            SESSIONS.remove(&session_id);
         }
-        info!("Extensions shut down during graceful shutdown.");
+        
+        info!("All sessions shut down during graceful shutdown.");
     });
 
     server.await; // Await the server

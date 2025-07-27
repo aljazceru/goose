@@ -3,6 +3,10 @@ use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    // Fix memory exhaustion issue by disabling vector database initialization
+    // This prevents LanceDB from consuming excessive memory during startup
+    env::set_var("GOOSE_ROUTER_TOOL_SELECTION_STRATEGY", "default");
+    
     let args: Vec<String> = env::args().collect();
     
     // Check if this is being called as an MCP server
@@ -49,12 +53,6 @@ async fn run_mcp_server(extension_name: &str) -> Result<(), anyhow::Error> {
         },
         "google_drive" => {
             let router = RouterService(GoogleDriveRouter::new().await);
-            let server = Server::new(router);
-            let transport = ByteTransport::new(stdin(), stdout());
-            server.run(transport).await
-        },
-        "jetbrains" => {
-            let router = RouterService(JetBrainsRouter::new());
             let server = Server::new(router);
             let transport = ByteTransport::new(stdin(), stdout());
             server.run(transport).await

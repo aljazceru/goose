@@ -19,8 +19,10 @@ struct AnyhowRejection(#[allow(dead_code)] anyhow::Error);
 
 impl warp::reject::Reject for AnyhowRejection {}
 
-pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| ExtensionManager::default());
-pub static AGENT: LazyLock<tokio::sync::Mutex<Agent>> = LazyLock::new(|| tokio::sync::Mutex::new(Agent::new()));
+pub static EXTENSION_MANAGER: LazyLock<ExtensionManager> = LazyLock::new(|| {
+    eprintln!("[DEBUG] Initializing EXTENSION_MANAGER");
+    ExtensionManager::default()
+});
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionRequest {
@@ -126,18 +128,38 @@ pub async fn start_session_handler(
 
     cleanup_expired_sessions().await;
 
-    // create fresh agent using provider from the template agent
-    let template = AGENT.lock().await;
+    // create fresh agent with provider
     let new_agent = Agent::new();
-    if let Ok(provider) = template.provider().await {
-        let _ = new_agent.update_provider(provider).await;
+    
+    // Configure provider from global config
+    {
+        use crate::config::PROVIDER_CONFIG;
+        use goose::providers::create;
+        use goose::model::ModelConfig;
+        
+        let config_guard = PROVIDER_CONFIG.read().await;
+        if let Some(provider_config) = config_guard.as_ref() {
+            let model_config = ModelConfig::new(provider_config.model_name.clone());
+            match create(&provider_config.provider_name, model_config) {
+                Ok(provider) => {
+                    if let Err(e) = new_agent.update_provider(provider).await {
+                        error!("Failed to set provider for new session: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to create provider for new session: {}", e);
+                }
+            }
+        } else {
+            warn!("No provider configuration available, using default");
+        }
     }
-    drop(template);
 
     let mut messages = vec![Message::user().with_text(&req.prompt)];
     let session_id = Uuid::new_v4();
     let session_name = session_id.to_string();
-    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+    let session_path = session::get_path(Identifier::Name(session_name.clone()))
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to get session path: {}", e))))?;
 
     let session = ApiSession::new(new_agent);
     let agent_ref = session.agent.clone();
@@ -153,7 +175,11 @@ pub async fn start_session_handler(
                 id: Identifier::Name(session_name.clone()),
                 working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 schedule_id: None,
+                execution_mode: None,
+                max_turns: None,
+                retry_config: Default::default(),
             }),
+            None,
         )
         .await;
 
@@ -181,7 +207,7 @@ pub async fn start_session_handler(
                             final_status = "warning".to_string();
                             full_response_text = "Conversation summarized to fit context window".to_string();
                             // Persist summarized messages immediately
-                            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone(), None).await {
                                 warn!("Failed to persist session {}: {}", session_name, e);
                             }
                             break; // Exit loop after summarization
@@ -206,7 +232,7 @@ pub async fn start_session_handler(
             }
 
             // Persist all messages after the stream is fully consumed
-            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone(), None).await {
                 warn!("Failed to persist session {}: {}", session_name, e);
             }
 
@@ -243,7 +269,8 @@ pub async fn reply_session_handler(
     cleanup_expired_sessions().await;
 
     let session_name = req.session_id.to_string();
-    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+    let session_path = session::get_path(Identifier::Name(session_name.clone()))
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to get session path: {}", e))))?;
 
     let session_entry = match SESSIONS.get(&req.session_id) {
         Some(s) => s,
@@ -288,7 +315,11 @@ pub async fn reply_session_handler(
                 id: Identifier::Name(session_name.clone()),
                 working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 schedule_id: None,
+                execution_mode: None,
+                max_turns: None,
+                retry_config: Default::default(),
             }),
+            None,
         )
         .await;
 
@@ -316,7 +347,7 @@ pub async fn reply_session_handler(
                             final_status = "warning".to_string();
                             full_response_text = "Conversation summarized to fit context window".to_string();
                             // Persist summarized messages immediately
-                            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+                            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone(), None).await {
                                 warn!("Failed to persist session {}: {}", session_name, e);
                             }
                             break; // Exit loop after summarization
@@ -341,7 +372,7 @@ pub async fn reply_session_handler(
             }
 
             // Persist all messages after the stream is fully consumed
-            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone()).await {
+            if let Err(e) = session::persist_messages(&session_path, &messages, provider.clone(), None).await {
                 warn!("Failed to persist session {}: {}", session_name, e);
             }
 
@@ -375,14 +406,15 @@ pub async fn end_session_handler(
     cleanup_expired_sessions().await;
 
     let session_name = req.session_id.to_string();
-    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+    let session_path = session::get_path(Identifier::Name(session_name.clone()))
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to get session path: {}", e))))?;
 
     // remove in-memory agent if present
     if let Some((_, api_session)) = SESSIONS.remove(&req.session_id) {
         shutdown_agent_extensions(api_session.agent).await;
     }
 
-    if std::fs::remove_file(&session_path).is_ok() {
+    if session_path.exists() && std::fs::remove_file(&session_path).is_ok() {
         let response = ApiResponse {
             message: "Session ended".to_string(),
             status: "success".to_string(),
@@ -409,10 +441,27 @@ pub async fn summarize_session_handler(
 ) -> Result<impl warp::Reply, Rejection> {
     info!("Summarizing session: {}", req.session_id);
 
-    let agent = AGENT.lock().await;
-
     let session_name = req.session_id.to_string();
-    let session_path = session::get_path(Identifier::Name(session_name.clone()));
+    let session_path = session::get_path(Identifier::Name(session_name.clone()))
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to get session path: {}", e))))?;
+
+    // Get the session-specific agent
+    let session_entry = match SESSIONS.get(&req.session_id) {
+        Some(s) => s,
+        None => {
+            let response = ApiResponse {
+                message: "Session not found".to_string(),
+                status: "error".to_string(),
+            };
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&response),
+                warp::http::StatusCode::NOT_FOUND,
+            ));
+        }
+    };
+    session_entry.touch();
+    let agent_ref = session_entry.agent.clone();
+    let agent = agent_ref.lock().await;
 
     let messages = match session::read_messages(&session_path) {
         Ok(m) => m,
@@ -437,7 +486,7 @@ pub async fn summarize_session_handler(
                 .map(|m| m.as_concat_text())
                 .unwrap_or_default();
 
-            if let Err(e) = session::persist_messages(&session_path, &summarized_messages, provider.clone()).await {
+            if let Err(e) = session::persist_messages(&session_path, &summarized_messages, provider.clone(), None).await {
                 warn!("Failed to persist session {}: {}", session_name, e);
             }
 
@@ -515,15 +564,18 @@ pub async fn metrics_handler() -> Result<impl warp::Reply, Rejection> {
     info!("Getting metrics");
 
 
-    // Gather pending request sizes for each extension
-    let agent_guard = AGENT.lock().await;
-    let pending_requests: HashMap<String, usize> = agent_guard
-        .get_tool_stats()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, v as usize))
-        .collect();
+    // Gather pending request sizes from all active sessions
+    let mut pending_requests: HashMap<String, usize> = HashMap::new();
+    
+    for entry in SESSIONS.iter() {
+        let session = entry.value();
+        let agent_guard = session.agent.lock().await;
+        if let Some(stats) = agent_guard.get_tool_stats().await {
+            for (tool_name, count) in stats {
+                *pending_requests.entry(tool_name).or_insert(0) += count as usize;
+            }
+        }
+    }
 
     let resp = MetricsResponse {
         active_sessions: SESSIONS.len(),

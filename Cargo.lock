@@ -3466,7 +3466,7 @@ dependencies = [
 name = "goose"
 version = "1.1.0"
 dependencies = [
- "ahash",
+ "ahash 0.8.11",
  "anyhow",
  "arrow",
  "async-stream",
@@ -3490,7 +3490,7 @@ dependencies = [
  "include_dir",
  "indoc 2.0.6",
  "jsonschema",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "keyring",
  "lancedb",
  "lazy_static",
@@ -4647,7 +4647,7 @@ version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1b46a0365a611fbf1d2143104dcf910aada96fafd295bab16c60b802bf6fa1d"
 dependencies = [
- "ahash",
+ "ahash 0.8.11",
  "base64 0.22.1",
  "bytecount",
  "email_address",
@@ -5700,28 +5700,6 @@ dependencies = [
  "thiserror 1.0.69",
  "triomphe",
  "uuid",
-]
-
-[[package]]
-
-name = "monostate"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aafe1be9d0c75642e3e50fedc7ecadf1ef1cbce6eb66462153fc44245343fbee"
-dependencies = [
- "monostate-impl",
- "serde",
-]
-
-[[package]]
-name = "monostate-impl"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c402a4092d5e204f32c9e155431046831fa712637043c58cb73bc6bc6c9663b5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.99",
 ]
 
 [[package]]
@@ -7089,7 +7067,7 @@ version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8eff4fa778b5c2a57e85c5f2fe3a709c52f0e60d23146e2151cbef5893f420e"
 dependencies = [
- "ahash",
+ "ahash 0.8.11",
  "fluent-uri",
  "once_cell",
  "parking_lot",
@@ -8088,7 +8066,6 @@ dependencies = [
 ]
 
 [[package]]
-
 name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8099,18 +8076,6 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
-
-[[package]]
-name = "spm_precompiled"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5851699c4033c63636f7ea4cf7b7c1f1bf06d0cc03cfb42e711de5a5c46cf326"
-dependencies = [
- "base64 0.13.1",
- "nom",
- "serde",
- "unicode-segmentation",
-]
 
 [[package]]
 name = "sqlparser"
