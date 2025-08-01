@@ -1324,7 +1324,17 @@ pub async fn generate_description_with_schedule_id(
             anyhow::anyhow!("Failed to generate session description")
         })?;
 
-    let description = result.0.as_concat_text();
+    // Extract only non-thinking text content for the description
+    let description = result.0.content
+        .iter()
+        .filter_map(|c| match c {
+            crate::message::MessageContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
 
     // Validate description length for security
     let sanitized_description = if description.chars().count() > 100 {

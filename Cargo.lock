@@ -3535,8 +3535,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "config 0.13.4",
  "dashmap 6.1.0",
+ "dirs 5.0.1",
  "futures",
  "futures-util",
  "goose",

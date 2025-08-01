@@ -54,6 +54,39 @@ pub struct EndSessionRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct GetSessionRequest {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub name: String,
+    pub modified: String,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionInfo>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetSessionResponse {
+    pub session_id: String,
+    pub name: String,
+    pub messages: Vec<SessionMessage>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SummarizeSessionRequest {
     pub session_id: Uuid,
 }
@@ -583,6 +616,158 @@ pub async fn metrics_handler() -> Result<impl warp::Reply, Rejection> {
     };
 
     Ok(warp::reply::json(&resp))
+}
+
+pub async fn list_sessions_handler(
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Listing all sessions");
+    
+    // Get all session files from the goose session directory
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| custom(AnyhowRejection(anyhow::anyhow!("Failed to get data directory"))))?;
+    let sessions_dir = data_dir.join("goose").join("sessions");
+    
+    let mut sessions = Vec::new();
+    
+    if sessions_dir.exists() {
+        match std::fs::read_dir(&sessions_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                        // Read the session file to get metadata
+                        match session::read_metadata(&path) {
+                            Ok(metadata) => {
+                                if let Ok(file_metadata) = entry.metadata() {
+                                    if let Ok(modified) = file_metadata.modified() {
+                                    let modified_str = chrono::DateTime::<chrono::Utc>::from(modified)
+                                        .format("%Y-%m-%d %H:%M:%S UTC")
+                                        .to_string();
+                                    
+                                    let session_id = path.file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    
+                                    sessions.push(SessionInfo {
+                                        id: session_id,
+                                        name: metadata.description,
+                                        modified: modified_str,
+                                        message_count: metadata.message_count,
+                                    });
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to read metadata for {:?}: {}", path, e);
+                        }
+                    }
+                }
+            }
+            }
+            Err(e) => {
+                warn!("Failed to read sessions directory: {}", e);
+            }
+        }
+    }
+    
+    // Sort by modified date (newest first)
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    
+    let response = ListSessionsResponse {
+        sessions,
+        status: "success".to_string(),
+    };
+    
+    Ok(warp::reply::with_status(
+        warp::reply::json(&response),
+        warp::http::StatusCode::OK,
+    ))
+}
+
+pub async fn get_session_handler(
+    req: GetSessionRequest,
+    _api_key: String,
+) -> Result<impl warp::Reply, Rejection> {
+    info!("Getting session: {}", req.session_id);
+    
+    let session_name = req.session_id.to_string();
+    let session_path = session::get_path(Identifier::Name(session_name.clone()))
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to get session path: {}", e))))?;
+    
+    // Check if session file exists
+    if !session_path.exists() {
+        let response = GetSessionResponse {
+            session_id: req.session_id.to_string(),
+            name: String::new(),
+            messages: Vec::new(),
+            status: "error".to_string(),
+        };
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&response),
+            warp::http::StatusCode::NOT_FOUND,
+        ));
+    }
+    
+    // Read session metadata and messages
+    let metadata = session::read_metadata(&session_path)
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to read session metadata: {}", e))))?;
+    
+    let messages = session::read_messages(&session_path)
+        .map_err(|e| custom(AnyhowRejection(anyhow::anyhow!("Failed to read session messages: {}", e))))?;
+    
+    // Convert messages to API format
+    let api_messages: Vec<SessionMessage> = messages.iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            // Messages typically alternate between user and assistant
+            // First message is usually user, then assistant, and so on
+            // We can also serialize the message and check the role field
+            let role = if let Ok(serialized) = serde_json::to_value(msg) {
+                if let Some(role_value) = serialized.get("role") {
+                    if let Some(role_str) = role_value.as_str() {
+                        role_str.to_lowercase()
+                    } else {
+                        // Fallback to alternating pattern
+                        if idx % 2 == 0 { "user" } else { "assistant" }.to_string()
+                    }
+                } else {
+                    // Fallback to alternating pattern
+                    if idx % 2 == 0 { "user" } else { "assistant" }.to_string()
+                }
+            } else {
+                // Fallback to alternating pattern
+                if idx % 2 == 0 { "user" } else { "assistant" }.to_string()
+            };
+            
+            // Extract text content, filtering out thinking tags
+            let content = msg.content
+                .iter()
+                .filter_map(|c| match c {
+                    MessageContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            
+            SessionMessage { role, content }
+        })
+        .collect();
+    
+    let response = GetSessionResponse {
+        session_id: req.session_id.to_string(),
+        name: metadata.description,
+        messages: api_messages,
+        status: "success".to_string(),
+    };
+    
+    Ok(warp::reply::with_status(
+        warp::reply::json(&response),
+        warp::http::StatusCode::OK,
+    ))
 }
 
 pub async fn handle_rejection(err: Rejection) -> Result<impl warp::Reply, Rejection> {

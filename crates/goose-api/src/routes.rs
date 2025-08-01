@@ -5,6 +5,7 @@ use crate::handlers::{
     end_session_handler, get_provider_config_handler, handle_rejection,
     list_extensions_handler, metrics_handler, reply_session_handler,
     start_session_handler, summarize_session_handler, with_api_key,
+    list_sessions_handler, get_session_handler,
 };
 use crate::config::{
     load_provider_config, load_configuration,
@@ -54,6 +55,19 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
         .and(warp::get())
         .and_then(metrics_handler);
 
+    let list_sessions = warp::path("sessions")
+        .and(warp::path("list"))
+        .and(warp::get())
+        .and(with_api_key(api_key.clone()))
+        .and_then(list_sessions_handler);
+
+    let get_session = warp::path("session")
+        .and(warp::path("get"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_api_key(api_key.clone()))
+        .and_then(get_session_handler);
+
     start_session
         .or(reply_session)
         .or(summarize_session)
@@ -61,6 +75,8 @@ pub fn build_routes(api_key: String) -> impl Filter<Extract = impl warp::Reply, 
         .or(list_extensions)
         .or(get_provider_config)
         .or(metrics)
+        .or(list_sessions)
+        .or(get_session)
         .recover(handle_rejection)
 }
 

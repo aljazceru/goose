@@ -23,6 +23,9 @@ futures-util = "0.3"
 # For session IDs
 uuid = { version = "1", features = ["serde", "v4"] }
 dashmap = "6"
+# For session listing
+dirs = "5"
+chrono = "0.4"
  # Add dynamic-library for extension loading
 
 [dev-dependencies]
