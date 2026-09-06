@@ -1,8 +1,0 @@
-# API server configuration
-host: 0.0.0.0
-port: 8181
-api_key: kurac
-
-# Provider configuration
-provider: ollama
-model: qwen3:4b
